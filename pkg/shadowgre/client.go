@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/missuo/shadow-gre/pkg/transport"
 	"github.com/missuo/shadow-gre/pkg/tunnel"
@@ -29,6 +30,7 @@ type streamConn struct {
 	closed   atomic.Bool
 	bytesIn  atomic.Int64
 	bytesOut atomic.Int64
+	closedCh chan struct{} // Closed when stream should be cleaned up
 }
 
 // Client represents a shadow-gre client
@@ -137,15 +139,16 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 
 	// Create stream connection
 	sc := &streamConn{
-		id:   streamID,
-		conn: tcpConn,
+		id:       streamID,
+		conn:     tcpConn,
+		closedCh: make(chan struct{}),
 	}
 	c.streams.Store(streamID, sc)
 	defer c.streams.Delete(streamID)
 
 	log.Printf("New connection from %s, stream ID: %d", tcpConn.RemoteAddr(), streamID)
 
-	// Forward TCP data to GRE tunnel
+	// TCP → GRE (read from TCP, send to GRE)
 	bufPtr := c.bufferPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer c.bufferPool.Put(bufPtr)
@@ -177,10 +180,19 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 		}
 	}
 
-	// Send close packet
+	// Send close packet to notify server (half-close)
 	closePkt := tunnel.NewClosePacket(streamID)
 	if closeData := closePkt.Marshal(); len(closeData) > 0 {
 		c.transport.Send(closeData)
+	}
+
+	// Wait for server to close the stream or timeout
+	select {
+	case <-sc.closedCh:
+		// Server closed the stream
+	case <-time.After(30 * time.Second):
+		// Timeout waiting for server close
+		log.Printf("Stream %d timeout waiting for server close", streamID)
 	}
 
 	log.Printf("Connection closed, stream ID: %d (sent: %d bytes, recv: %d bytes)",
@@ -220,6 +232,13 @@ func (c *Client) handleGREPacket(data []byte) {
 		}
 
 	case tunnel.StreamClose:
+		// Server closed the stream, notify handleConnection
+		select {
+		case <-sc.closedCh:
+			// Already closed
+		default:
+			close(sc.closedCh)
+		}
 		// Close TCP connection
 		sc.conn.Close()
 	}

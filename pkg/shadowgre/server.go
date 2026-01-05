@@ -187,7 +187,7 @@ func (ss *serverStream) readFromBackend(cs *clientState) {
 
 	for {
 		// Read from backend (limit to maxReadSize to respect MTU)
-		n, err := ss.backendConn.Read(buf[tunnel.StreamHeaderSize : tunnel.StreamHeaderSize+greBufferSize-tunnel.StreamHeaderSize])
+		n, err := ss.backendConn.Read(buf[tunnel.StreamHeaderSize : tunnel.StreamHeaderSize+maxReadSize])
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Stream %d backend read error: %v", ss.id, err)
