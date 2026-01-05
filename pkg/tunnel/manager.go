@@ -1,60 +1,153 @@
 package tunnel
 
 import (
+	"bytes"
 	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+const (
+	// WriteBufferSize is the size of write buffer before flushing
+	WriteBufferSize = 4096
+	// WriteFlushInterval is the max time to hold data before flushing
+	WriteFlushInterval = 5 * time.Millisecond
+	// ReadChannelSize is the size of read channel buffer
+	ReadChannelSize = 512
+)
+
 // Connection represents a virtual connection over the tunnel
 type Connection struct {
-	ID       uint32
-	manager  *Manager
-	readCh   chan []byte
-	closed   atomic.Bool
-	closeCh  chan struct{}
-	seq      atomic.Uint32
-	mu       sync.Mutex
+	ID      uint32
+	manager *Manager
+
+	// Read buffering
+	readCh  chan []byte
+	readBuf bytes.Buffer
+	readMu  sync.Mutex
+
+	// Write buffering
+	writeBuf   bytes.Buffer
+	writeMu    sync.Mutex
+	flushTimer *time.Timer
+
+	closed  atomic.Bool
+	closeCh chan struct{}
+	seq     atomic.Uint32
 }
 
 // NewConnection creates a new virtual connection
 func NewConnection(id uint32, manager *Manager) *Connection {
-	return &Connection{
+	c := &Connection{
 		ID:      id,
 		manager: manager,
-		readCh:  make(chan []byte, 256),
+		readCh:  make(chan []byte, ReadChannelSize),
 		closeCh: make(chan struct{}),
 	}
+	return c
 }
 
 // Read reads data from the connection
 func (c *Connection) Read(p []byte) (n int, err error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
+	// First, try to read from existing buffer
+	if c.readBuf.Len() > 0 {
+		return c.readBuf.Read(p)
+	}
+
 	if c.closed.Load() {
 		return 0, io.EOF
 	}
 
+	// Wait for first data block
 	select {
 	case data := <-c.readCh:
 		if data == nil {
 			return 0, io.EOF
 		}
-		n = copy(p, data)
-		return n, nil
+		c.readBuf.Write(data)
 	case <-c.closeCh:
 		return 0, io.EOF
 	}
+
+	// Try to read more data without blocking (drain the channel)
+	for {
+		select {
+		case data := <-c.readCh:
+			if data == nil {
+				break
+			}
+			c.readBuf.Write(data)
+			// Don't accumulate too much
+			if c.readBuf.Len() >= len(p) {
+				goto done
+			}
+		default:
+			goto done
+		}
+	}
+
+done:
+	return c.readBuf.Read(p)
 }
 
-// Write writes data to the connection
+// Write writes data to the connection with buffering
 func (c *Connection) Write(p []byte) (n int, err error) {
 	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
 
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	n, _ = c.writeBuf.Write(p)
+
+	// Flush if buffer is large enough
+	if c.writeBuf.Len() >= WriteBufferSize {
+		c.flushLocked()
+		return n, nil
+	}
+
+	// Set timer to flush after interval
+	if c.flushTimer == nil {
+		c.flushTimer = time.AfterFunc(WriteFlushInterval, func() {
+			c.writeMu.Lock()
+			defer c.writeMu.Unlock()
+			c.flushLocked()
+		})
+	}
+
+	return n, nil
+}
+
+// flushLocked sends buffered data (must hold writeMu)
+func (c *Connection) flushLocked() {
+	if c.flushTimer != nil {
+		c.flushTimer.Stop()
+		c.flushTimer = nil
+	}
+
+	if c.writeBuf.Len() == 0 {
+		return
+	}
+
+	data := c.writeBuf.Bytes()
+	c.writeBuf.Reset()
+
 	seq := c.seq.Add(1)
-	frame := NewDataFrame(c.ID, seq, p)
-	return len(p), c.manager.sendFrame(frame)
+	frame := NewDataFrame(c.ID, seq, data)
+	c.manager.sendFrame(frame)
+}
+
+// Flush forces a flush of the write buffer
+func (c *Connection) Flush() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.flushLocked()
+	return nil
 }
 
 // Close closes the connection
@@ -62,6 +155,9 @@ func (c *Connection) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
+
+	// Flush remaining data
+	c.Flush()
 
 	close(c.closeCh)
 	frame := NewFinFrame(c.ID)
@@ -76,11 +172,21 @@ func (c *Connection) deliver(data []byte) {
 		return
 	}
 
+	// Make a copy
+	buf := make([]byte, len(data))
+	copy(buf, data)
+
 	select {
-	case c.readCh <- data:
+	case c.readCh <- buf:
 	case <-c.closeCh:
 	default:
-		// Buffer full, drop packet
+		// Buffer full, try harder with short timeout
+		select {
+		case c.readCh <- buf:
+		case <-c.closeCh:
+		case <-time.After(10 * time.Millisecond):
+			// Drop if still can't deliver
+		}
 	}
 }
 
@@ -90,7 +196,7 @@ type Manager struct {
 	connections sync.Map // map[uint32]*Connection
 	connIDSeq   atomic.Uint32
 	acceptCh    chan *Connection
-	onConnect   func(conn *Connection) // Server-side callback for new connections
+	onConnect   func(conn *Connection)
 	mu          sync.RWMutex
 }
 
@@ -120,12 +226,6 @@ func (m *Manager) Dial() (*Connection, error) {
 		return nil, err
 	}
 
-	// Wait for SYN-ACK with timeout
-	timeout := time.NewTimer(10 * time.Second)
-	defer timeout.Stop()
-
-	// For simplicity, we consider the connection established after sending SYN
-	// In a production system, you'd wait for SYN-ACK
 	return conn, nil
 }
 
@@ -147,62 +247,52 @@ func (m *Manager) HandleFrame(data []byte) error {
 
 	switch frame.Type {
 	case FrameSyn:
-		// New incoming connection
 		conn := NewConnection(frame.ConnID, m)
 		m.connections.Store(frame.ConnID, conn)
 
-		// Send SYN-ACK
 		synAckFrame := NewSynAckFrame(frame.ConnID)
 		if err := m.sendFrame(synAckFrame); err != nil {
 			return err
 		}
 
-		// Notify accept channel or callback
 		if m.onConnect != nil {
 			go m.onConnect(conn)
 		} else {
 			select {
 			case m.acceptCh <- conn:
 			default:
-				// Accept queue full
 			}
 		}
 
 	case FrameSynAck:
-		// Connection established acknowledgment
-		// Connection is already stored, nothing more to do
+		// Connection established
 
 	case FrameData:
-		// Data frame
 		if connI, ok := m.connections.Load(frame.ConnID); ok {
 			conn := connI.(*Connection)
 			conn.deliver(frame.Payload)
 		}
 
 	case FrameFin:
-		// Connection close request
 		if connI, ok := m.connections.Load(frame.ConnID); ok {
 			conn := connI.(*Connection)
 			conn.closed.Store(true)
 			close(conn.closeCh)
 			m.connections.Delete(frame.ConnID)
 
-			// Send FIN-ACK
 			finAckFrame := NewFinAckFrame(frame.ConnID)
 			m.sendFrame(finAckFrame)
 		}
 
 	case FrameFinAck:
-		// Connection close acknowledgment
 		m.connections.Delete(frame.ConnID)
 
 	case FramePing:
-		// Respond with pong
 		pongFrame := NewPongFrame()
 		m.sendFrame(pongFrame)
 
 	case FramePong:
-		// Keepalive response received
+		// Keepalive received
 	}
 
 	return nil
