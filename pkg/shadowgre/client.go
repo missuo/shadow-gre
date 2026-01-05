@@ -16,10 +16,14 @@ import (
 
 const (
 	copyBufferSize = 64 * 1024 // 64KB buffer for io.Copy
-	// maxReadSize must fit in MTU: 1500 - IP(20) - GRE(12) - StreamHeader(5) = 1463
+	// maxReadSize must fit in MTU: 1500 - IP(20) - GRE(8) - StreamHeader(5) = 1467
 	// Use 1400 for safety margin
 	maxReadSize = 1400
-	greBufferSize = maxReadSize + tunnel.StreamHeaderSize
+	// GRE header size with Key flag: 4(base) + 4(key) = 8
+	greHeaderSize = 8
+	// greBufferSize needs to fit: GRE(8) + StreamHeader(5) + Data(1400) = 1413
+	// Round up for alignment
+	greBufferSize = 1420
 )
 
 // streamConn represents an active TCP connection
@@ -154,8 +158,10 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	defer c.bufferPool.Put(bufPtr)
 
 	for {
-		// Read from TCP (limit to maxReadSize to respect MTU)
-		n, err := tcpConn.Read(buf[tunnel.StreamHeaderSize : tunnel.StreamHeaderSize+maxReadSize])
+		// Reserve space for GRE header at the beginning, then Stream header
+		// Layout: [GRE header (8)][Stream header (5)][TCP data (up to 1400)]
+		dataOffset := greHeaderSize + tunnel.StreamHeaderSize
+		n, err := tcpConn.Read(buf[dataOffset : dataOffset+maxReadSize])
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Stream %d read error: %v", streamID, err)
@@ -165,16 +171,16 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 
 		sc.bytesOut.Add(int64(n))
 
-		// Build stream packet directly in buffer (zero-copy)
+		// Build stream packet directly in buffer starting after GRE header (zero-copy)
 		pkt := tunnel.StreamPacket{
 			StreamID: streamID,
 			Flags:    tunnel.StreamData,
-			Data:     buf[tunnel.StreamHeaderSize : tunnel.StreamHeaderSize+n],
+			Data:     buf[dataOffset : dataOffset+n],
 		}
-		size := pkt.MarshalTo(buf)
+		streamSize := pkt.MarshalTo(buf[greHeaderSize:])
 
-		// Send via GRE
-		if err := c.transport.Send(buf[:size]); err != nil {
+		// Send via GRE (will add GRE header to the reserved space)
+		if err := c.transport.SendZeroCopy(buf, greHeaderSize, streamSize); err != nil {
 			log.Printf("Stream %d send error: %v", streamID, err)
 			break
 		}

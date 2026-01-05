@@ -90,8 +90,8 @@ func (s *Server) Start() error {
 
 // handleGREPacket processes incoming GRE packets
 func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
-	// Parse stream packet
-	pkt, err := tunnel.UnmarshalStream(data)
+	// Parse stream packet (no copy - just parse header and reference data)
+	pkt, err := tunnel.UnmarshalStreamNoCopy(data)
 	if err != nil {
 		return
 	}
@@ -132,19 +132,20 @@ func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 			return
 		}
 
-		// Queue data for async write to backend (must copy!)
+		// Queue data for async write to backend (copy once here, not twice!)
 		if len(pkt.Data) > 0 {
 			// Don't accept data if backend already closed
 			if ss.closed.Load() {
 				return
 			}
 
-			data := make([]byte, len(pkt.Data))
-			copy(data, pkt.Data)
+			// Copy data only once (pkt.Data references the receive buffer)
+			dataCopy := make([]byte, len(pkt.Data))
+			copy(dataCopy, pkt.Data)
 
 			// Try to queue without blocking
 			select {
-			case ss.writeCh <- data:
+			case ss.writeCh <- dataCopy:
 				// Queued successfully
 			default:
 				// Channel full - backend is too slow, must close stream to avoid blocking receiveLoop
@@ -220,8 +221,10 @@ func (ss *serverStream) readFromBackend(cs *clientState) {
 	defer ss.server.bufferPool.Put(bufPtr)
 
 	for {
-		// Read from backend (limit to maxReadSize to respect MTU)
-		n, err := ss.backendConn.Read(buf[tunnel.StreamHeaderSize : tunnel.StreamHeaderSize+maxReadSize])
+		// Reserve space for GRE header at the beginning, then Stream header
+		// Layout: [GRE header (8)][Stream header (5)][Backend data (up to 1400)]
+		dataOffset := greHeaderSize + tunnel.StreamHeaderSize
+		n, err := ss.backendConn.Read(buf[dataOffset : dataOffset+maxReadSize])
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Stream %d backend read error: %v", ss.id, err)
@@ -231,16 +234,16 @@ func (ss *serverStream) readFromBackend(cs *clientState) {
 
 		ss.bytesIn.Add(int64(n))
 
-		// Build stream packet directly in buffer (zero-copy)
+		// Build stream packet directly in buffer starting after GRE header (zero-copy)
 		pkt := tunnel.StreamPacket{
 			StreamID: ss.id,
 			Flags:    tunnel.StreamData,
-			Data:     buf[tunnel.StreamHeaderSize : tunnel.StreamHeaderSize+n],
+			Data:     buf[dataOffset : dataOffset+n],
 		}
-		size := pkt.MarshalTo(buf)
+		streamSize := pkt.MarshalTo(buf[greHeaderSize:])
 
-		// Send via GRE
-		if err := ss.server.transport.Send(ss.clientIP, buf[:size]); err != nil {
+		// Send via GRE (will add GRE header to the reserved space)
+		if err := ss.server.transport.SendZeroCopy(ss.clientIP, buf, greHeaderSize, streamSize); err != nil {
 			log.Printf("Stream %d send error: %v", ss.id, err)
 			break
 		}

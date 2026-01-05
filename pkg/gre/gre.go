@@ -128,13 +128,13 @@ type Packet struct {
 }
 
 // NewPacket creates a new GRE packet with the given key and payload
-func NewPacket(key uint32, seq uint32, payload []byte) *Packet {
+// Note: Sequence is removed for better performance (not used for reordering)
+func NewPacket(key uint32, payload []byte) *Packet {
 	return &Packet{
 		Header: &Header{
-			Flags:        FlagKey | FlagSequence,
+			Flags:        FlagKey, // Only use Key, remove Sequence
 			ProtocolType: EtherTypeTransparentEthernet,
 			Key:          key,
-			Sequence:     seq,
 		},
 		Payload: payload,
 	}
@@ -147,6 +147,36 @@ func (p *Packet) Marshal() []byte {
 	copy(result, header)
 	copy(result[len(header):], p.Payload)
 	return result
+}
+
+// MarshalTo serializes the GRE packet directly into the provided buffer (zero-copy)
+// The buffer must have enough space: HeaderSize + len(payload)
+// Returns the total number of bytes written
+func (p *Packet) MarshalTo(buf []byte) int {
+	headerSize := p.Header.HeaderSize()
+
+	// Write header directly to buffer
+	binary.BigEndian.PutUint16(buf[0:2], p.Header.Flags)
+	binary.BigEndian.PutUint16(buf[2:4], p.Header.ProtocolType)
+
+	offset := 4
+	if p.Header.Flags&FlagChecksum != 0 {
+		binary.BigEndian.PutUint16(buf[offset:offset+2], p.Header.Checksum)
+		binary.BigEndian.PutUint16(buf[offset+2:offset+4], p.Header.Reserved1)
+		offset += 4
+	}
+	if p.Header.Flags&FlagKey != 0 {
+		binary.BigEndian.PutUint32(buf[offset:offset+4], p.Header.Key)
+		offset += 4
+	}
+	if p.Header.Flags&FlagSequence != 0 {
+		binary.BigEndian.PutUint32(buf[offset:offset+4], p.Header.Sequence)
+		offset += 4
+	}
+
+	// Copy payload
+	n := copy(buf[headerSize:], p.Payload)
+	return headerSize + n
 }
 
 // UnmarshalPacket deserializes a complete GRE packet from bytes

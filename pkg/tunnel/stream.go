@@ -63,6 +63,26 @@ func UnmarshalStream(data []byte) (*StreamPacket, error) {
 	return p, nil
 }
 
+// UnmarshalStreamNoCopy deserializes a stream packet from bytes without copying data
+// WARNING: The returned Data slice references the input buffer. Caller must copy if needed.
+func UnmarshalStreamNoCopy(data []byte) (*StreamPacket, error) {
+	if len(data) < StreamHeaderSize {
+		return nil, ErrStreamTooShort
+	}
+
+	p := &StreamPacket{
+		StreamID: binary.BigEndian.Uint32(data[0:4]),
+		Flags:    data[4],
+	}
+
+	if len(data) > StreamHeaderSize {
+		// No copy - just reference the slice
+		p.Data = data[StreamHeaderSize:]
+	}
+
+	return p, nil
+}
+
 // NewDataPacket creates a data packet
 func NewDataPacket(streamID uint32, data []byte) *StreamPacket {
 	return &StreamPacket{

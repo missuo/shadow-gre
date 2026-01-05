@@ -60,16 +60,39 @@ func (t *ServerTransport) Send(clientIP net.IP, payload []byte) error {
 		return fmt.Errorf("transport closed")
 	}
 
-	// Get or create client state
-	clientKey := clientIP.String()
-	stateI, _ := t.clients.LoadOrStore(clientKey, &clientState{ip: clientIP})
-	state := stateI.(*clientState)
-
-	seq := state.seq.Add(1)
-	packet := gre.NewPacket(t.key, seq, payload)
+	packet := gre.NewPacket(t.key, payload)
 	greData := packet.Marshal()
 
 	_, err := t.conn.WriteToIP(greData, &net.IPAddr{IP: clientIP})
+	return err
+}
+
+// SendZeroCopy sends data to a specific client with zero-copy
+// buf: the buffer containing the payload
+// headerOffset: where to write the GRE header (usually 8 for greHeaderSize)
+// payloadSize: size of the payload after the header
+func (t *ServerTransport) SendZeroCopy(clientIP net.IP, buf []byte, headerOffset, payloadSize int) error {
+	if t.closed.Load() {
+		return fmt.Errorf("transport closed")
+	}
+
+	// Write GRE header directly at the beginning of the buffer
+	// GRE header format (8 bytes with Key):
+	// 0-1: Flags (0x2000 = Key flag)
+	// 2-3: Protocol Type (0x6558)
+	// 4-7: Key
+	buf[0] = 0x20 // Flags high byte (FlagKey = 0x2000)
+	buf[1] = 0x00 // Flags low byte
+	buf[2] = 0x65 // Protocol Type high byte
+	buf[3] = 0x58 // Protocol Type low byte
+	buf[4] = byte(t.key >> 24)
+	buf[5] = byte(t.key >> 16)
+	buf[6] = byte(t.key >> 8)
+	buf[7] = byte(t.key)
+
+	totalSize := headerOffset + payloadSize
+
+	_, err := t.conn.WriteToIP(buf[:totalSize], &net.IPAddr{IP: clientIP})
 	return err
 }
 
