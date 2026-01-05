@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,12 @@ const (
 	WriteFlushInterval = 1 * time.Millisecond
 	// ReadChannelSize is the size of read channel buffer
 	ReadChannelSize = 1024
+	// DialTimeout is the timeout for connection establishment
+	DialTimeout = 5 * time.Second
+)
+
+var (
+	ErrDialTimeout = errors.New("dial timeout: no SYN-ACK received")
 )
 
 // Connection represents a virtual connection over the tunnel
@@ -32,20 +39,45 @@ type Connection struct {
 	writeMu    sync.Mutex
 	flushTimer *time.Timer
 
-	closed  atomic.Bool
-	closeCh chan struct{}
-	seq     atomic.Uint32
+	// Connection state
+	established chan struct{}
+	closed      atomic.Bool
+	closeCh     chan struct{}
+	seq         atomic.Uint32
 }
 
 // NewConnection creates a new virtual connection
 func NewConnection(id uint32, manager *Manager) *Connection {
 	c := &Connection{
-		ID:      id,
-		manager: manager,
-		readCh:  make(chan []byte, ReadChannelSize),
-		closeCh: make(chan struct{}),
+		ID:          id,
+		manager:     manager,
+		readCh:      make(chan []byte, ReadChannelSize),
+		closeCh:     make(chan struct{}),
+		established: make(chan struct{}),
 	}
 	return c
+}
+
+// markEstablished marks the connection as established
+func (c *Connection) markEstablished() {
+	select {
+	case <-c.established:
+		// Already established
+	default:
+		close(c.established)
+	}
+}
+
+// waitEstablished waits for connection to be established
+func (c *Connection) waitEstablished(timeout time.Duration) error {
+	select {
+	case <-c.established:
+		return nil
+	case <-time.After(timeout):
+		return ErrDialTimeout
+	case <-c.closeCh:
+		return io.EOF
+	}
 }
 
 // Read reads data from the connection
@@ -81,7 +113,6 @@ func (c *Connection) Read(p []byte) (n int, err error) {
 				break
 			}
 			c.readBuf.Write(data)
-			// Don't accumulate too much
 			if c.readBuf.Len() >= len(p) {
 				goto done
 			}
@@ -105,13 +136,13 @@ func (c *Connection) Write(p []byte) (n int, err error) {
 
 	n, _ = c.writeBuf.Write(p)
 
-	// Flush if buffer is large enough
+	// Flush immediately if buffer is large enough
 	if c.writeBuf.Len() >= WriteBufferSize {
 		c.flushLocked()
 		return n, nil
 	}
 
-	// Set timer to flush after interval
+	// For small writes, use a short timer
 	if c.flushTimer == nil {
 		c.flushTimer = time.AfterFunc(WriteFlushInterval, func() {
 			c.writeMu.Lock()
@@ -134,7 +165,7 @@ func (c *Connection) flushLocked() {
 		return
 	}
 
-	// Must copy data before Reset, as Bytes() returns underlying slice
+	// Must copy data before Reset
 	data := make([]byte, c.writeBuf.Len())
 	copy(data, c.writeBuf.Bytes())
 	c.writeBuf.Reset()
@@ -158,10 +189,16 @@ func (c *Connection) Close() error {
 		return nil
 	}
 
-	// Flush remaining data
 	c.Flush()
 
-	close(c.closeCh)
+	// Safe close of closeCh
+	select {
+	case <-c.closeCh:
+		// Already closed
+	default:
+		close(c.closeCh)
+	}
+
 	frame := NewFinFrame(c.ID)
 	c.manager.sendFrame(frame)
 	c.manager.removeConnection(c.ID)
@@ -174,7 +211,6 @@ func (c *Connection) deliver(data []byte) {
 		return
 	}
 
-	// Make a copy
 	buf := make([]byte, len(data))
 	copy(buf, data)
 
@@ -202,12 +238,12 @@ func NewManager(sendFunc func([]byte) error) *Manager {
 	}
 }
 
-// SetOnConnect sets the callback for new incoming connections (server mode)
+// SetOnConnect sets the callback for new incoming connections
 func (m *Manager) SetOnConnect(fn func(conn *Connection)) {
 	m.onConnect = fn
 }
 
-// Dial creates a new outgoing connection
+// Dial creates a new outgoing connection with SYN-ACK handshake
 func (m *Manager) Dial() (*Connection, error) {
 	connID := m.connIDSeq.Add(1)
 	conn := NewConnection(connID, m)
@@ -216,6 +252,12 @@ func (m *Manager) Dial() (*Connection, error) {
 	// Send SYN
 	synFrame := NewSynFrame(connID)
 	if err := m.sendFrame(synFrame); err != nil {
+		m.connections.Delete(connID)
+		return nil, err
+	}
+
+	// Wait for SYN-ACK
+	if err := conn.waitEstablished(DialTimeout); err != nil {
 		m.connections.Delete(connID)
 		return nil, err
 	}
@@ -242,6 +284,7 @@ func (m *Manager) HandleFrame(data []byte) error {
 	switch frame.Type {
 	case FrameSyn:
 		conn := NewConnection(frame.ConnID, m)
+		conn.markEstablished() // Server side is immediately established
 		m.connections.Store(frame.ConnID, conn)
 
 		synAckFrame := NewSynAckFrame(frame.ConnID)
@@ -259,7 +302,11 @@ func (m *Manager) HandleFrame(data []byte) error {
 		}
 
 	case FrameSynAck:
-		// Connection established
+		// Mark connection as established
+		if connI, ok := m.connections.Load(frame.ConnID); ok {
+			conn := connI.(*Connection)
+			conn.markEstablished()
+		}
 
 	case FrameData:
 		if connI, ok := m.connections.Load(frame.ConnID); ok {
@@ -270,8 +317,16 @@ func (m *Manager) HandleFrame(data []byte) error {
 	case FrameFin:
 		if connI, ok := m.connections.Load(frame.ConnID); ok {
 			conn := connI.(*Connection)
-			conn.closed.Store(true)
-			close(conn.closeCh)
+			// Use atomic to prevent double close
+			if conn.closed.Swap(true) {
+				return nil // Already closed
+			}
+			select {
+			case <-conn.closeCh:
+				// Already closed
+			default:
+				close(conn.closeCh)
+			}
 			m.connections.Delete(frame.ConnID)
 
 			finAckFrame := NewFinAckFrame(frame.ConnID)
