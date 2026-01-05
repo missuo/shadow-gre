@@ -13,6 +13,8 @@ import (
 	"github.com/missuo/shadow-gre/pkg/tunnel"
 )
 
+const copyBufferSize = 64 * 1024 // 64KB buffer for io.Copy
+
 // Client represents a shadow-gre client
 type Client struct {
 	listenAddr string
@@ -114,21 +116,23 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 
 	log.Printf("New connection from %s, tunnel ID: %d", tcpConn.RemoteAddr(), tunnelConn.ID)
 
-	// Bidirectional copy
+	// Bidirectional copy with larger buffer
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	// TCP -> Tunnel
 	go func() {
 		defer wg.Done()
-		io.Copy(tunnelConn, tcpConn)
+		buf := make([]byte, copyBufferSize)
+		io.CopyBuffer(tunnelConn, tcpConn, buf)
 		tunnelConn.Close()
 	}()
 
 	// Tunnel -> TCP
 	go func() {
 		defer wg.Done()
-		io.Copy(tcpConn, tunnelConn)
+		buf := make([]byte, copyBufferSize)
+		io.CopyBuffer(tcpConn, tunnelConn, buf)
 		tcpConn.Close()
 	}()
 

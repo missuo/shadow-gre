@@ -10,11 +10,11 @@ import (
 
 const (
 	// WriteBufferSize is the size of write buffer before flushing
-	WriteBufferSize = 4096
+	WriteBufferSize = 8192
 	// WriteFlushInterval is the max time to hold data before flushing
-	WriteFlushInterval = 5 * time.Millisecond
+	WriteFlushInterval = 1 * time.Millisecond
 	// ReadChannelSize is the size of read channel buffer
-	ReadChannelSize = 512
+	ReadChannelSize = 1024
 )
 
 // Connection represents a virtual connection over the tunnel
@@ -181,14 +181,6 @@ func (c *Connection) deliver(data []byte) {
 	select {
 	case c.readCh <- buf:
 	case <-c.closeCh:
-	default:
-		// Buffer full, try harder with short timeout
-		select {
-		case c.readCh <- buf:
-		case <-c.closeCh:
-		case <-time.After(10 * time.Millisecond):
-			// Drop if still can't deliver
-		}
 	}
 }
 

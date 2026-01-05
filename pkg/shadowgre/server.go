@@ -115,21 +115,23 @@ func (s *Server) handleConnection(tunnelConn *tunnel.Connection) {
 
 	log.Printf("Tunnel connection %d forwarding to %s", tunnelConn.ID, s.backendAddr)
 
-	// Bidirectional copy
+	// Bidirectional copy with larger buffer
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	// Backend -> Tunnel
 	go func() {
 		defer wg.Done()
-		io.Copy(tunnelConn, backendConn)
+		buf := make([]byte, copyBufferSize)
+		io.CopyBuffer(tunnelConn, backendConn, buf)
 		tunnelConn.Close()
 	}()
 
 	// Tunnel -> Backend
 	go func() {
 		defer wg.Done()
-		io.Copy(backendConn, tunnelConn)
+		buf := make([]byte, copyBufferSize)
+		io.CopyBuffer(backendConn, tunnelConn, buf)
 		backendConn.Close()
 	}()
 
