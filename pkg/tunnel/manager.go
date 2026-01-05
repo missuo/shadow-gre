@@ -13,8 +13,8 @@ const (
 	// MaxPayloadSize is the maximum payload per GRE packet (MTU - IP header - GRE header - frame header)
 	// MTU(1500) - IP(20) - GRE(12) - Frame(11) = 1457, use 1400 for safety
 	MaxPayloadSize = 1400
-	// ReadChannelSize is the size of read channel buffer
-	ReadChannelSize = 4096
+	// ReadChannelSize is the size of read channel buffer (increased for better throughput)
+	ReadChannelSize = 16384
 	// DialTimeout is the timeout for connection establishment
 	DialTimeout = 5 * time.Second
 )

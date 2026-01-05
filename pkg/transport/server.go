@@ -9,6 +9,12 @@ import (
 	"github.com/missuo/shadow-gre/pkg/gre"
 )
 
+// packetData holds a received packet with client info
+type packetData struct {
+	clientIP net.IP
+	payload  []byte
+}
+
 // ServerTransport handles raw socket communication for GRE server mode
 // It can accept connections from any client IP
 type ServerTransport struct {
@@ -21,6 +27,7 @@ type ServerTransport struct {
 	closed    atomic.Bool
 	closeCh   chan struct{}
 	wg        sync.WaitGroup
+	processCh chan *packetData // Queue for async packet processing
 }
 
 type clientState struct {
@@ -36,10 +43,11 @@ func NewServerTransport(localIP net.IP, key uint32) (*ServerTransport, error) {
 	}
 
 	return &ServerTransport{
-		localIP: localIP,
-		conn:    conn,
-		key:     key,
-		closeCh: make(chan struct{}),
+		localIP:   localIP,
+		conn:      conn,
+		key:       key,
+		closeCh:   make(chan struct{}),
+		processCh: make(chan *packetData, 10000), // Large buffer for async processing
 	}, nil
 }
 
@@ -48,10 +56,11 @@ func (t *ServerTransport) SetReceiveHandler(handler func(clientIP net.IP, payloa
 	t.onReceive = handler
 }
 
-// Start starts the receive loop
+// Start starts the receive and process loops
 func (t *ServerTransport) Start() {
-	t.wg.Add(1)
+	t.wg.Add(2)
 	go t.receiveLoop()
+	go t.processLoop()
 }
 
 // Send sends data to a specific client
@@ -106,11 +115,39 @@ func (t *ServerTransport) receiveLoop() {
 		clientKey := addr.IP.String()
 		t.clients.LoadOrStore(clientKey, &clientState{ip: addr.IP})
 
-		// Deliver payload to handler (must be synchronous to preserve order)
-		if t.onReceive != nil && len(packet.Payload) > 0 {
+		// Queue payload for async processing
+		if len(packet.Payload) > 0 {
 			payload := make([]byte, len(packet.Payload))
 			copy(payload, packet.Payload)
-			t.onReceive(addr.IP, payload)
+
+			pkt := &packetData{
+				clientIP: addr.IP,
+				payload:  payload,
+			}
+
+			select {
+			case t.processCh <- pkt:
+			case <-t.closeCh:
+				return
+			default:
+				// Queue full, drop packet (TCP will retransmit)
+			}
+		}
+	}
+}
+
+// processLoop processes packets from the queue
+func (t *ServerTransport) processLoop() {
+	defer t.wg.Done()
+
+	for {
+		select {
+		case pkt := <-t.processCh:
+			if t.onReceive != nil {
+				t.onReceive(pkt.clientIP, pkt.payload)
+			}
+		case <-t.closeCh:
+			return
 		}
 	}
 }

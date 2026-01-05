@@ -24,6 +24,7 @@ type RawTransport struct {
 	wg          sync.WaitGroup
 	recvCount   atomic.Uint64
 	sendCount   atomic.Uint64
+	processCh   chan []byte // Queue for async packet processing
 }
 
 // NewRawTransport creates a new raw socket transport
@@ -35,11 +36,12 @@ func NewRawTransport(localIP, remoteIP net.IP, key uint32) (*RawTransport, error
 	}
 
 	return &RawTransport{
-		localIP:  localIP,
-		remoteIP: remoteIP,
-		conn:     conn,
-		key:      key,
-		closeCh:  make(chan struct{}),
+		localIP:   localIP,
+		remoteIP:  remoteIP,
+		conn:      conn,
+		key:       key,
+		closeCh:   make(chan struct{}),
+		processCh: make(chan []byte, 10000), // Large buffer for async processing
 	}, nil
 }
 
@@ -48,10 +50,11 @@ func (t *RawTransport) SetReceiveHandler(handler func([]byte)) {
 	t.onReceive = handler
 }
 
-// Start starts the receive loop
+// Start starts the receive and process loops
 func (t *RawTransport) Start() {
-	t.wg.Add(1)
+	t.wg.Add(2)
 	go t.receiveLoop()
+	go t.processLoop()
 }
 
 // Send sends data through the GRE tunnel
@@ -114,13 +117,36 @@ func (t *RawTransport) receiveLoop() {
 			continue
 		}
 
-		// Deliver payload to handler (must be synchronous to preserve order)
-		if t.onReceive != nil && len(packet.Payload) > 0 {
+		// Queue payload for async processing
+		if len(packet.Payload) > 0 {
 			payload := make([]byte, len(packet.Payload))
 			copy(payload, packet.Payload)
-			t.onReceive(payload)
-			delivered++
-			t.recvCount.Add(1)
+
+			select {
+			case t.processCh <- payload:
+				delivered++
+				t.recvCount.Add(1)
+			case <-t.closeCh:
+				return
+			default:
+				// Queue full, drop packet (TCP will retransmit)
+			}
+		}
+	}
+}
+
+// processLoop processes packets from the queue
+func (t *RawTransport) processLoop() {
+	defer t.wg.Done()
+
+	for {
+		select {
+		case payload := <-t.processCh:
+			if t.onReceive != nil {
+				t.onReceive(payload)
+			}
+		case <-t.closeCh:
+			return
 		}
 	}
 }
