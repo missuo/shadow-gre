@@ -8,13 +8,25 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/missuo/shadow-gre/pkg/transport"
 	"github.com/missuo/shadow-gre/pkg/tunnel"
 )
 
-const copyBufferSize = 64 * 1024 // 64KB buffer for io.Copy
+const (
+	copyBufferSize = 64 * 1024 // 64KB buffer for io.Copy
+	greBufferSize  = 2048      // Buffer for GRE packets (MTU + headers)
+)
+
+// streamConn represents an active TCP connection
+type streamConn struct {
+	id       uint32
+	conn     net.Conn
+	writeMu  sync.Mutex
+	closed   atomic.Bool
+	bytesIn  atomic.Int64
+	bytesOut atomic.Int64
+}
 
 // Client represents a shadow-gre client
 type Client struct {
@@ -23,22 +35,39 @@ type Client struct {
 	serverIP   net.IP
 	key        uint32
 	transport  *transport.RawTransport
-	manager    *tunnel.Manager
 	listener   net.Listener
 	closed     atomic.Bool
 	wg         sync.WaitGroup
-	stopStats  chan struct{}
+
+	// Stream management
+	nextStreamID atomic.Uint32
+	streams      sync.Map // map[uint32]*streamConn
+
+	// Buffer pool for zero-copy
+	bufferPool sync.Pool
 }
 
 // NewClient creates a new shadow-gre client
 func NewClient(listenAddr string, localIP, serverIP net.IP, key uint32) *Client {
-	return &Client{
+	c := &Client{
 		listenAddr: listenAddr,
 		localIP:    localIP,
 		serverIP:   serverIP,
 		key:        key,
-		stopStats:  make(chan struct{}),
 	}
+
+	// Initialize buffer pool
+	c.bufferPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, greBufferSize)
+			return &buf
+		},
+	}
+
+	// Start from stream ID 1
+	c.nextStreamID.Store(1)
+
+	return c
 }
 
 // Start starts the client
@@ -50,17 +79,8 @@ func (c *Client) Start() error {
 	}
 	c.transport = trans
 
-	// Create tunnel manager
-	c.manager = tunnel.NewManager(func(data []byte) error {
-		return c.transport.Send(data)
-	})
-
-	// Set receive handler
-	c.transport.SetReceiveHandler(func(data []byte) {
-		if err := c.manager.HandleFrame(data); err != nil {
-			log.Printf("Failed to handle frame: %v", err)
-		}
-	})
+	// Set receive handler to process incoming GRE packets
+	c.transport.SetReceiveHandler(c.handleGREPacket)
 
 	// Start transport
 	c.transport.Start()
@@ -77,9 +97,6 @@ func (c *Client) Start() error {
 
 	c.wg.Add(1)
 	go c.acceptLoop()
-
-	// Start stats logging
-	go c.statsLoop()
 
 	return nil
 }
@@ -112,60 +129,96 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	defer c.wg.Done()
 	defer tcpConn.Close()
 
-	// Create tunnel connection
-	tunnelConn, err := c.manager.Dial()
-	if err != nil {
-		log.Printf("Failed to create tunnel connection: %v", err)
-		return
+	// Allocate stream ID
+	streamID := c.nextStreamID.Add(1)
+
+	// Create stream connection
+	sc := &streamConn{
+		id:   streamID,
+		conn: tcpConn,
 	}
-	defer tunnelConn.Close()
+	c.streams.Store(streamID, sc)
+	defer c.streams.Delete(streamID)
 
-	log.Printf("New connection from %s, tunnel ID: %d", tcpConn.RemoteAddr(), tunnelConn.ID)
+	log.Printf("New connection from %s, stream ID: %d", tcpConn.RemoteAddr(), streamID)
 
-	// Bidirectional copy with larger buffer
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	var bytesToTunnel, bytesFromTunnel int64
-
-	// TCP -> Tunnel
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, copyBufferSize)
-		n, _ := io.CopyBuffer(tunnelConn, tcpConn, buf)
-		bytesToTunnel = n
-		tunnelConn.Close()
-	}()
-
-	// Tunnel -> TCP
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, copyBufferSize)
-		n, _ := io.CopyBuffer(tcpConn, tunnelConn, buf)
-		bytesFromTunnel = n
-		tcpConn.Close()
-	}()
-
-	wg.Wait()
-	log.Printf("Connection closed, tunnel ID: %d (to_tunnel: %d bytes, from_tunnel: %d bytes)", tunnelConn.ID, bytesToTunnel, bytesFromTunnel)
-}
-
-// statsLoop periodically logs statistics
-func (c *Client) statsLoop() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// Forward TCP data to GRE tunnel
+	bufPtr := c.bufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer c.bufferPool.Put(bufPtr)
 
 	for {
-		select {
-		case <-ticker.C:
-			fSent, fRecv, bSent, bRecv, dropped := c.manager.Stats()
-			if fSent > 0 || fRecv > 0 {
-				log.Printf("[STATS] frames_sent=%d frames_recv=%d payload_sent=%d payload_recv=%d dropped=%d",
-					fSent, fRecv, bSent, bRecv, dropped)
+		// Read from TCP
+		n, err := tcpConn.Read(buf[tunnel.StreamHeaderSize:])
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Stream %d read error: %v", streamID, err)
 			}
-		case <-c.stopStats:
-			return
+			break
 		}
+
+		sc.bytesOut.Add(int64(n))
+
+		// Build stream packet directly in buffer (zero-copy)
+		pkt := tunnel.StreamPacket{
+			StreamID: streamID,
+			Flags:    tunnel.StreamData,
+			Data:     buf[tunnel.StreamHeaderSize : tunnel.StreamHeaderSize+n],
+		}
+		size := pkt.MarshalTo(buf)
+
+		// Send via GRE
+		if err := c.transport.Send(buf[:size]); err != nil {
+			log.Printf("Stream %d send error: %v", streamID, err)
+			break
+		}
+	}
+
+	// Send close packet
+	closePkt := tunnel.NewClosePacket(streamID)
+	if closeData := closePkt.Marshal(); len(closeData) > 0 {
+		c.transport.Send(closeData)
+	}
+
+	log.Printf("Connection closed, stream ID: %d (sent: %d bytes, recv: %d bytes)",
+		streamID, sc.bytesOut.Load(), sc.bytesIn.Load())
+}
+
+// handleGREPacket processes incoming GRE packets
+func (c *Client) handleGREPacket(data []byte) {
+	// Parse stream packet
+	pkt, err := tunnel.UnmarshalStream(data)
+	if err != nil {
+		return
+	}
+
+	// Look up stream
+	scI, ok := c.streams.Load(pkt.StreamID)
+	if !ok {
+		// Stream not found, ignore
+		return
+	}
+	sc := scI.(*streamConn)
+
+	// Handle based on flags
+	switch pkt.Flags {
+	case tunnel.StreamData:
+		// Write data to TCP connection
+		if len(pkt.Data) > 0 {
+			sc.writeMu.Lock()
+			n, err := sc.conn.Write(pkt.Data)
+			sc.writeMu.Unlock()
+
+			if err != nil {
+				sc.conn.Close()
+				return
+			}
+			sc.bytesIn.Add(int64(n))
+		}
+
+	case tunnel.StreamClose:
+		// Close TCP connection
+		sc.conn.Close()
 	}
 }
 
@@ -175,17 +228,21 @@ func (c *Client) Close() error {
 		return nil
 	}
 
-	close(c.stopStats)
-
 	if c.listener != nil {
 		c.listener.Close()
 	}
-	if c.manager != nil {
-		c.manager.Close()
-	}
+
+	// Close all streams
+	c.streams.Range(func(key, value interface{}) bool {
+		sc := value.(*streamConn)
+		sc.conn.Close()
+		return true
+	})
+
 	if c.transport != nil {
 		c.transport.Close()
 	}
+
 	c.wg.Wait()
 	return nil
 }

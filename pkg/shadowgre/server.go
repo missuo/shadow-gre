@@ -7,11 +7,29 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/missuo/shadow-gre/pkg/transport"
 	"github.com/missuo/shadow-gre/pkg/tunnel"
 )
+
+// clientState manages streams for a single client
+type clientState struct {
+	clientIP net.IP
+	streams  sync.Map // map[uint32]*serverStream
+	server   *Server
+}
+
+// serverStream represents a backend connection for a stream
+type serverStream struct {
+	id          uint32
+	clientIP    net.IP
+	backendConn net.Conn
+	writeMu     sync.Mutex
+	closed      atomic.Bool
+	bytesIn     atomic.Int64
+	bytesOut    atomic.Int64
+	server      *Server
+}
 
 // Server represents a shadow-gre server
 type Server struct {
@@ -19,27 +37,31 @@ type Server struct {
 	backendAddr string
 	key         uint32
 	transport   *transport.ServerTransport
-	managers    sync.Map // map[string]*clientManager
+	clients     sync.Map // map[string]*clientState
 	closed      atomic.Bool
 	wg          sync.WaitGroup
-	stopStats   chan struct{}
-}
 
-// clientManager manages connections from a single client IP
-type clientManager struct {
-	clientIP    net.IP
-	manager     *tunnel.Manager
-	server      *Server
+	// Buffer pool for zero-copy
+	bufferPool sync.Pool
 }
 
 // NewServer creates a new shadow-gre server
 func NewServer(localIP net.IP, backendAddr string, key uint32) *Server {
-	return &Server{
+	s := &Server{
 		localIP:     localIP,
 		backendAddr: backendAddr,
 		key:         key,
-		stopStats:   make(chan struct{}),
 	}
+
+	// Initialize buffer pool
+	s.bufferPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, greBufferSize)
+			return &buf
+		},
+	}
+
+	return s
 }
 
 // Start starts the server
@@ -51,125 +73,155 @@ func (s *Server) Start() error {
 	}
 	s.transport = trans
 
-	// Set receive handler
-	s.transport.SetReceiveHandler(func(clientIP net.IP, data []byte) {
-		s.handlePacket(clientIP, data)
-	})
+	// Set receive handler to process incoming GRE packets
+	s.transport.SetReceiveHandler(s.handleGREPacket)
 
 	// Start transport
 	s.transport.Start()
 
 	log.Printf("Server listening on %s (GRE protocol), forwarding to %s", s.localIP, s.backendAddr)
 
-	// Start stats logging
-	go s.statsLoop()
-
 	return nil
 }
 
-// handlePacket handles a packet from a client
-func (s *Server) handlePacket(clientIP net.IP, data []byte) {
+// handleGREPacket processes incoming GRE packets
+func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
+	// Parse stream packet
+	pkt, err := tunnel.UnmarshalStream(data)
+	if err != nil {
+		return
+	}
+
+	// Get or create client state
 	clientKey := clientIP.String()
-
-	// Get or create client manager
-	managerI, loaded := s.managers.LoadOrStore(clientKey, s.newClientManager(clientIP))
-	cm := managerI.(*clientManager)
-
-	if !loaded {
-		log.Printf("New client connected: %s", clientIP)
-	}
-
-	// Handle frame
-	if err := cm.manager.HandleFrame(data); err != nil {
-		log.Printf("Failed to handle frame from %s: %v", clientIP, err)
-	}
-}
-
-// newClientManager creates a new client manager
-func (s *Server) newClientManager(clientIP net.IP) *clientManager {
-	cm := &clientManager{
+	csI, _ := s.clients.LoadOrStore(clientKey, &clientState{
 		clientIP: clientIP,
 		server:   s,
+	})
+	cs := csI.(*clientState)
+
+	// Handle based on flags
+	switch pkt.Flags {
+	case tunnel.StreamData:
+		// Get or create stream
+		ssI, loaded := cs.streams.LoadOrStore(pkt.StreamID, nil)
+		if !loaded || ssI == nil {
+			// Create new backend connection
+			ss, err := s.createStream(pkt.StreamID, clientIP, cs)
+			if err != nil {
+				log.Printf("Failed to create stream %d for %s: %v", pkt.StreamID, clientIP, err)
+				return
+			}
+			cs.streams.Store(pkt.StreamID, ss)
+			ssI = ss
+		}
+
+		ss := ssI.(*serverStream)
+		if ss == nil {
+			return
+		}
+
+		// Write data to backend
+		if len(pkt.Data) > 0 {
+			ss.writeMu.Lock()
+			n, err := ss.backendConn.Write(pkt.Data)
+			ss.writeMu.Unlock()
+
+			if err != nil {
+				ss.close()
+				return
+			}
+			ss.bytesOut.Add(int64(n))
+		}
+
+	case tunnel.StreamClose:
+		// Close stream
+		if ssI, ok := cs.streams.Load(pkt.StreamID); ok {
+			if ss := ssI.(*serverStream); ss != nil {
+				ss.close()
+			}
+		}
+		cs.streams.Delete(pkt.StreamID)
 	}
-
-	// Create tunnel manager with send function
-	cm.manager = tunnel.NewManager(func(data []byte) error {
-		return s.transport.Send(clientIP, data)
-	})
-
-	// Set callback for new connections
-	cm.manager.SetOnConnect(func(conn *tunnel.Connection) {
-		s.wg.Add(1)
-		go s.handleConnection(conn)
-	})
-
-	return cm
 }
 
-// handleConnection handles a tunnel connection by forwarding to backend
-func (s *Server) handleConnection(tunnelConn *tunnel.Connection) {
-	defer s.wg.Done()
-	defer tunnelConn.Close()
-
+// createStream creates a new backend connection for a stream
+func (s *Server) createStream(streamID uint32, clientIP net.IP, cs *clientState) (*serverStream, error) {
 	// Connect to backend
 	backendConn, err := net.Dial("tcp", s.backendAddr)
 	if err != nil {
-		log.Printf("Failed to connect to backend %s: %v", s.backendAddr, err)
-		return
+		return nil, err
 	}
-	defer backendConn.Close()
 
-	log.Printf("Tunnel connection %d forwarding to %s", tunnelConn.ID, s.backendAddr)
+	ss := &serverStream{
+		id:          streamID,
+		clientIP:    clientIP,
+		backendConn: backendConn,
+		server:      s,
+	}
 
-	// Bidirectional copy with larger buffer
-	var wg sync.WaitGroup
-	wg.Add(2)
+	log.Printf("Stream %d from %s forwarding to %s", streamID, clientIP, s.backendAddr)
 
-	var bytesFromBackend, bytesToBackend int64
+	// Start reading from backend
+	s.wg.Add(1)
+	go ss.readFromBackend(cs)
 
-	// Backend -> Tunnel
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, copyBufferSize)
-		n, _ := io.CopyBuffer(tunnelConn, backendConn, buf)
-		bytesFromBackend = n
-		tunnelConn.Close()
-	}()
-
-	// Tunnel -> Backend
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, copyBufferSize)
-		n, _ := io.CopyBuffer(backendConn, tunnelConn, buf)
-		bytesToBackend = n
-		backendConn.Close()
-	}()
-
-	wg.Wait()
-	log.Printf("Tunnel connection %d closed (sent: %d bytes, recv: %d bytes)", tunnelConn.ID, bytesToBackend, bytesFromBackend)
+	return ss, nil
 }
 
-// statsLoop periodically logs statistics
-func (s *Server) statsLoop() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+// readFromBackend reads data from backend and sends to client via GRE
+func (ss *serverStream) readFromBackend(cs *clientState) {
+	defer ss.server.wg.Done()
+	defer ss.close()
+
+	bufPtr := ss.server.bufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer ss.server.bufferPool.Put(bufPtr)
 
 	for {
-		select {
-		case <-ticker.C:
-			s.managers.Range(func(key, value interface{}) bool {
-				cm := value.(*clientManager)
-				clientIP := key.(string)
-				fSent, fRecv, bSent, bRecv, dropped := cm.manager.Stats()
-				if fSent > 0 || fRecv > 0 {
-					log.Printf("[STATS] Client %s: frames_sent=%d frames_recv=%d payload_sent=%d payload_recv=%d dropped=%d",
-						clientIP, fSent, fRecv, bSent, bRecv, dropped)
-				}
-				return true
-			})
-		case <-s.stopStats:
-			return
+		// Read from backend
+		n, err := ss.backendConn.Read(buf[tunnel.StreamHeaderSize:])
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Stream %d backend read error: %v", ss.id, err)
+			}
+			break
 		}
+
+		ss.bytesIn.Add(int64(n))
+
+		// Build stream packet directly in buffer (zero-copy)
+		pkt := tunnel.StreamPacket{
+			StreamID: ss.id,
+			Flags:    tunnel.StreamData,
+			Data:     buf[tunnel.StreamHeaderSize : tunnel.StreamHeaderSize+n],
+		}
+		size := pkt.MarshalTo(buf)
+
+		// Send via GRE
+		if err := ss.server.transport.Send(ss.clientIP, buf[:size]); err != nil {
+			log.Printf("Stream %d send error: %v", ss.id, err)
+			break
+		}
+	}
+
+	// Send close packet
+	closePkt := tunnel.NewClosePacket(ss.id)
+	if closeData := closePkt.Marshal(); len(closeData) > 0 {
+		ss.server.transport.Send(ss.clientIP, closeData)
+	}
+
+	// Remove from client streams
+	cs.streams.Delete(ss.id)
+
+	log.Printf("Stream %d from %s closed (sent: %d bytes, recv: %d bytes)",
+		ss.id, ss.clientIP, ss.bytesIn.Load(), ss.bytesOut.Load())
+}
+
+// close closes the stream
+func (ss *serverStream) close() {
+	if !ss.closed.Swap(true) {
+		ss.backendConn.Close()
 	}
 }
 
@@ -179,18 +231,22 @@ func (s *Server) Close() error {
 		return nil
 	}
 
-	close(s.stopStats)
-
-	// Close all client managers
-	s.managers.Range(func(key, value interface{}) bool {
-		cm := value.(*clientManager)
-		cm.manager.Close()
+	// Close all client streams
+	s.clients.Range(func(key, value interface{}) bool {
+		cs := value.(*clientState)
+		cs.streams.Range(func(k, v interface{}) bool {
+			if ss := v.(*serverStream); ss != nil {
+				ss.close()
+			}
+			return true
+		})
 		return true
 	})
 
 	if s.transport != nil {
 		s.transport.Close()
 	}
+
 	s.wg.Wait()
 	return nil
 }
