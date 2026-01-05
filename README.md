@@ -1,4 +1,4 @@
-# shadow-gre
+# Shadow GRE
 
 TCP over GRE tunnel - Encapsulate TCP traffic into GRE protocol (IP Protocol 47) for transmission.
 

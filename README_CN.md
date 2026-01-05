@@ -1,4 +1,4 @@
-# shadow-gre
+# Shadow GRE
 
 TCP over GRE 隧道 - 将 TCP 流量封装成 GRE 协议（IP Protocol 47）进行传输。
 
