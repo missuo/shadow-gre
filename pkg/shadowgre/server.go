@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/missuo/shadow-gre/pkg/transport"
 	"github.com/missuo/shadow-gre/pkg/tunnel"
@@ -14,13 +15,14 @@ import (
 
 // Server represents a shadow-gre server
 type Server struct {
-	localIP    net.IP
+	localIP     net.IP
 	backendAddr string
-	key        uint32
-	transport  *transport.ServerTransport
-	managers   sync.Map // map[string]*clientManager
-	closed     atomic.Bool
-	wg         sync.WaitGroup
+	key         uint32
+	transport   *transport.ServerTransport
+	managers    sync.Map // map[string]*clientManager
+	closed      atomic.Bool
+	wg          sync.WaitGroup
+	stopStats   chan struct{}
 }
 
 // clientManager manages connections from a single client IP
@@ -36,6 +38,7 @@ func NewServer(localIP net.IP, backendAddr string, key uint32) *Server {
 		localIP:     localIP,
 		backendAddr: backendAddr,
 		key:         key,
+		stopStats:   make(chan struct{}),
 	}
 }
 
@@ -57,6 +60,9 @@ func (s *Server) Start() error {
 	s.transport.Start()
 
 	log.Printf("Server listening on %s (GRE protocol), forwarding to %s", s.localIP, s.backendAddr)
+
+	// Start stats logging
+	go s.statsLoop()
 
 	return nil
 }
@@ -143,11 +149,37 @@ func (s *Server) handleConnection(tunnelConn *tunnel.Connection) {
 	log.Printf("Tunnel connection %d closed (sent: %d bytes, recv: %d bytes)", tunnelConn.ID, bytesToBackend, bytesFromBackend)
 }
 
+// statsLoop periodically logs statistics
+func (s *Server) statsLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.managers.Range(func(key, value interface{}) bool {
+				cm := value.(*clientManager)
+				clientIP := key.(string)
+				fSent, fRecv, bSent, bRecv, dropped := cm.manager.Stats()
+				if fSent > 0 || fRecv > 0 {
+					log.Printf("[STATS] Client %s: frames_sent=%d frames_recv=%d payload_sent=%d payload_recv=%d dropped=%d",
+						clientIP, fSent, fRecv, bSent, bRecv, dropped)
+				}
+				return true
+			})
+		case <-s.stopStats:
+			return
+		}
+	}
+}
+
 // Close closes the server
 func (s *Server) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+
+	close(s.stopStats)
 
 	// Close all client managers
 	s.managers.Range(func(key, value interface{}) bool {

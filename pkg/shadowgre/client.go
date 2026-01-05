@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/missuo/shadow-gre/pkg/transport"
 	"github.com/missuo/shadow-gre/pkg/tunnel"
@@ -26,6 +27,7 @@ type Client struct {
 	listener   net.Listener
 	closed     atomic.Bool
 	wg         sync.WaitGroup
+	stopStats  chan struct{}
 }
 
 // NewClient creates a new shadow-gre client
@@ -35,6 +37,7 @@ func NewClient(listenAddr string, localIP, serverIP net.IP, key uint32) *Client 
 		localIP:    localIP,
 		serverIP:   serverIP,
 		key:        key,
+		stopStats:  make(chan struct{}),
 	}
 }
 
@@ -74,6 +77,9 @@ func (c *Client) Start() error {
 
 	c.wg.Add(1)
 	go c.acceptLoop()
+
+	// Start stats logging
+	go c.statsLoop()
 
 	return nil
 }
@@ -144,11 +150,32 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	log.Printf("Connection closed, tunnel ID: %d (to_tunnel: %d bytes, from_tunnel: %d bytes)", tunnelConn.ID, bytesToTunnel, bytesFromTunnel)
 }
 
+// statsLoop periodically logs statistics
+func (c *Client) statsLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			fSent, fRecv, bSent, bRecv, dropped := c.manager.Stats()
+			if fSent > 0 || fRecv > 0 {
+				log.Printf("[STATS] frames_sent=%d frames_recv=%d payload_sent=%d payload_recv=%d dropped=%d",
+					fSent, fRecv, bSent, bRecv, dropped)
+			}
+		case <-c.stopStats:
+			return
+		}
+	}
+}
+
 // Close closes the client
 func (c *Client) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
+
+	close(c.stopStats)
 
 	if c.listener != nil {
 		c.listener.Close()

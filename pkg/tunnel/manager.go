@@ -13,8 +13,6 @@ const (
 	// MaxPayloadSize is the maximum payload per GRE packet (MTU - IP header - GRE header - frame header)
 	// MTU(1500) - IP(20) - GRE(12) - Frame(11) = 1457, use 1400 for safety
 	MaxPayloadSize = 1400
-	// WriteFlushInterval is the max time to hold data before flushing
-	WriteFlushInterval = 1 * time.Millisecond
 	// ReadChannelSize is the size of read channel buffer
 	ReadChannelSize = 4096
 	// DialTimeout is the timeout for connection establishment
@@ -35,16 +33,14 @@ type Connection struct {
 	readBuf bytes.Buffer
 	readMu  sync.Mutex
 
-	// Write buffering
-	writeBuf   bytes.Buffer
-	writeMu    sync.Mutex
-	flushTimer *time.Timer
-
 	// Connection state
 	established chan struct{}
 	closed      atomic.Bool
 	closeCh     chan struct{}
 	seq         atomic.Uint32
+
+	// Diagnostics
+	packetsDropped atomic.Uint64
 }
 
 // NewConnection creates a new virtual connection
@@ -107,83 +103,58 @@ func (c *Connection) Read(p []byte) (n int, err error) {
 	}
 
 	// Try to read more data without blocking (drain the channel)
+drainLoop:
 	for {
 		select {
 		case data := <-c.readCh:
 			if data == nil {
-				break
+				break drainLoop
 			}
 			c.readBuf.Write(data)
 			if c.readBuf.Len() >= len(p) {
-				goto done
+				break drainLoop
 			}
 		default:
-			goto done
+			break drainLoop
 		}
 	}
-
-done:
 	return c.readBuf.Read(p)
 }
 
-// Write writes data to the connection with buffering
+// Write writes data to the connection
 func (c *Connection) Write(p []byte) (n int, err error) {
 	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
 
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	n, _ = c.writeBuf.Write(p)
-
-	// Flush immediately if buffer is large enough
-	if c.writeBuf.Len() >= MaxPayloadSize {
-		c.flushLocked()
-		return n, nil
-	}
-
-	// For small writes, use a short timer
-	if c.flushTimer == nil {
-		c.flushTimer = time.AfterFunc(WriteFlushInterval, func() {
-			c.writeMu.Lock()
-			defer c.writeMu.Unlock()
-			c.flushLocked()
-		})
-	}
-
-	return n, nil
-}
-
-// flushLocked sends buffered data (must hold writeMu)
-func (c *Connection) flushLocked() {
-	if c.flushTimer != nil {
-		c.flushTimer.Stop()
-		c.flushTimer = nil
-	}
-
-	// Send in chunks that fit within MTU
-	for c.writeBuf.Len() > 0 {
-		size := c.writeBuf.Len()
-		if size > MaxPayloadSize {
-			size = MaxPayloadSize
+	// For small writes, send immediately without buffering (better latency)
+	if len(p) <= MaxPayloadSize {
+		seq := c.seq.Add(1)
+		frame := NewDataFrame(c.ID, seq, p)
+		err = c.manager.sendFrame(frame)
+		if err != nil {
+			return 0, err
 		}
+		return len(p), nil
+	}
 
-		data := make([]byte, size)
-		c.writeBuf.Read(data)
+	// For large writes, split into chunks
+	written := 0
+	for written < len(p) {
+		end := written + MaxPayloadSize
+		if end > len(p) {
+			end = len(p)
+		}
+		chunk := p[written:end]
 
 		seq := c.seq.Add(1)
-		frame := NewDataFrame(c.ID, seq, data)
-		c.manager.sendFrame(frame)
+		frame := NewDataFrame(c.ID, seq, chunk)
+		if err = c.manager.sendFrame(frame); err != nil {
+			return written, err
+		}
+		written = end
 	}
-}
-
-// Flush forces a flush of the write buffer
-func (c *Connection) Flush() error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	c.flushLocked()
-	return nil
+	return written, nil
 }
 
 // Close closes the connection
@@ -191,8 +162,6 @@ func (c *Connection) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
-
-	c.Flush()
 
 	// Safe close of closeCh
 	select {
@@ -224,6 +193,7 @@ func (c *Connection) deliver(data []byte) {
 	case <-c.closeCh:
 	default:
 		// Buffer full, drop packet
+		c.packetsDropped.Add(1)
 	}
 }
 
@@ -235,6 +205,13 @@ type Manager struct {
 	acceptCh    chan *Connection
 	onConnect   func(conn *Connection)
 	mu          sync.RWMutex
+
+	// Diagnostics
+	framesSent       atomic.Uint64
+	framesReceived   atomic.Uint64
+	bytesPayloadSent atomic.Uint64
+	bytesPayloadRecv atomic.Uint64
+	packetsDropped   atomic.Uint64
 }
 
 // NewManager creates a new connection manager
@@ -288,6 +265,11 @@ func (m *Manager) HandleFrame(data []byte) error {
 		return err
 	}
 
+	m.framesReceived.Add(1)
+	if frame.Type == FrameData {
+		m.bytesPayloadRecv.Add(uint64(len(frame.Payload)))
+	}
+
 	switch frame.Type {
 	case FrameSyn:
 		conn := NewConnection(frame.ConnID, m)
@@ -319,6 +301,9 @@ func (m *Manager) HandleFrame(data []byte) error {
 		if connI, ok := m.connections.Load(frame.ConnID); ok {
 			conn := connI.(*Connection)
 			conn.deliver(frame.Payload)
+			if conn.packetsDropped.Load() > 0 {
+				m.packetsDropped.Store(conn.packetsDropped.Load())
+			}
 		}
 
 	case FrameFin:
@@ -357,6 +342,10 @@ func (m *Manager) HandleFrame(data []byte) error {
 // sendFrame marshals and sends a frame
 func (m *Manager) sendFrame(frame *Frame) error {
 	data := frame.Marshal()
+	m.framesSent.Add(1)
+	if frame.Type == FrameData {
+		m.bytesPayloadSent.Add(uint64(len(frame.Payload)))
+	}
 	return m.sendFunc(data)
 }
 
@@ -374,4 +363,9 @@ func (m *Manager) Close() error {
 	})
 	close(m.acceptCh)
 	return nil
+}
+
+// Stats returns diagnostic statistics
+func (m *Manager) Stats() (framesSent, framesRecv, bytesSent, bytesRecv, dropped uint64) {
+	return m.framesSent.Load(), m.framesReceived.Load(), m.bytesPayloadSent.Load(), m.bytesPayloadRecv.Load(), m.packetsDropped.Load()
 }

@@ -114,11 +114,11 @@ func (t *RawTransport) receiveLoop() {
 			continue
 		}
 
-		// Deliver payload to handler asynchronously
+		// Deliver payload to handler (must be synchronous to preserve order)
 		if t.onReceive != nil && len(packet.Payload) > 0 {
 			payload := make([]byte, len(packet.Payload))
 			copy(payload, packet.Payload)
-			go t.onReceive(payload)
+			t.onReceive(payload)
 			delivered++
 			t.recvCount.Add(1)
 		}

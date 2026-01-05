@@ -106,13 +106,11 @@ func (t *ServerTransport) receiveLoop() {
 		clientKey := addr.IP.String()
 		t.clients.LoadOrStore(clientKey, &clientState{ip: addr.IP})
 
-		// Deliver payload to handler asynchronously
+		// Deliver payload to handler (must be synchronous to preserve order)
 		if t.onReceive != nil && len(packet.Payload) > 0 {
 			payload := make([]byte, len(packet.Payload))
 			copy(payload, packet.Payload)
-			clientIP := make(net.IP, len(addr.IP))
-			copy(clientIP, addr.IP)
-			go t.onReceive(clientIP, payload)
+			t.onReceive(addr.IP, payload)
 		}
 	}
 }
