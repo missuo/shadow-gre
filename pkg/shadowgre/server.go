@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/missuo/shadow-gre/pkg/transport"
 	"github.com/missuo/shadow-gre/pkg/tunnel"
@@ -21,15 +22,17 @@ type clientState struct {
 
 // serverStream represents a backend connection for a stream
 type serverStream struct {
-	id          uint32
-	clientIP    net.IP
-	backendConn net.Conn
-	writeCh     chan []byte // Sequenced write channel
-	closed      atomic.Bool
-	bytesIn     atomic.Int64
-	bytesOut    atomic.Int64
-	server      *Server
-	wg          sync.WaitGroup
+	id               uint32
+	clientIP         net.IP
+	backendConn      net.Conn
+	writeCh          chan []byte // Sequenced write channel
+	closed           atomic.Bool
+	backendClosed    atomic.Bool // Backend read side closed
+	clientCloseRecv  atomic.Bool // Received StreamClose from client
+	bytesIn          atomic.Int64
+	bytesOut         atomic.Int64
+	server           *Server
+	wg               sync.WaitGroup
 }
 
 // Server represents a shadow-gre server
@@ -131,26 +134,39 @@ func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 
 		// Queue data for async write to backend (must copy!)
 		if len(pkt.Data) > 0 {
+			// Don't accept data if backend already closed
+			if ss.closed.Load() {
+				return
+			}
+
 			data := make([]byte, len(pkt.Data))
 			copy(data, pkt.Data)
 
+			// Try to queue without blocking
 			select {
 			case ss.writeCh <- data:
 				// Queued successfully
 			default:
-				// Channel full, drop packet (this shouldn't happen with large buffer)
-				log.Printf("Stream %d write channel full, dropping %d bytes", pkt.StreamID, len(pkt.Data))
+				// Channel full - backend is too slow, must close stream to avoid blocking receiveLoop
+				log.Printf("Stream %d write channel full (backend too slow), closing stream", pkt.StreamID)
+				go ss.close()  // Close async to avoid blocking
+				cs.streams.Delete(pkt.StreamID)
 			}
 		}
 
 	case tunnel.StreamClose:
-		// Close stream
+		// Client closed, mark and cleanup if backend also closed
 		if ssI, ok := cs.streams.Load(pkt.StreamID); ok {
 			if ss := ssI.(*serverStream); ss != nil {
-				ss.close()
+				ss.clientCloseRecv.Store(true)
+				ss.close()  // Close backend connection
+
+				// Delete stream if backend also closed, otherwise let readFromBackend handle it
+				if ss.backendClosed.Load() {
+					cs.streams.Delete(pkt.StreamID)
+				}
 			}
 		}
-		cs.streams.Delete(pkt.StreamID)
 	}
 }
 
@@ -166,7 +182,7 @@ func (s *Server) createStream(streamID uint32, clientIP net.IP, cs *clientState)
 		id:          streamID,
 		clientIP:    clientIP,
 		backendConn: backendConn,
-		writeCh:     make(chan []byte, 256), // Buffered channel for async writes
+		writeCh:     make(chan []byte, 1024), // Larger buffer to avoid blocking
 		server:      s,
 	}
 
@@ -198,7 +214,6 @@ func (ss *serverStream) writeToBackend(cs *clientState) {
 // readFromBackend reads data from backend and sends to client via GRE
 func (ss *serverStream) readFromBackend(cs *clientState) {
 	defer ss.server.wg.Done()
-	defer ss.close()
 
 	bufPtr := ss.server.bufferPool.Get().(*[]byte)
 	buf := *bufPtr
@@ -231,17 +246,30 @@ func (ss *serverStream) readFromBackend(cs *clientState) {
 		}
 	}
 
-	// Send close packet
+	// Mark backend as closed
+	ss.backendClosed.Store(true)
+
+	// Send close packet to client
 	closePkt := tunnel.NewClosePacket(ss.id)
 	if closeData := closePkt.Marshal(); len(closeData) > 0 {
 		ss.server.transport.Send(ss.clientIP, closeData)
 	}
 
-	// Remove from client streams
-	cs.streams.Delete(ss.id)
-
-	log.Printf("Stream %d from %s closed (sent: %d bytes, recv: %d bytes)",
-		ss.id, ss.clientIP, ss.bytesIn.Load(), ss.bytesOut.Load())
+	// Only delete stream if client also closed, otherwise wait for client close
+	if ss.clientCloseRecv.Load() {
+		cs.streams.Delete(ss.id)
+		log.Printf("Stream %d from %s closed (sent: %d bytes, recv: %d bytes)",
+			ss.id, ss.clientIP, ss.bytesIn.Load(), ss.bytesOut.Load())
+	} else {
+		// Wait for client close with timeout
+		go func() {
+			time.Sleep(10 * time.Second)
+			if !ss.clientCloseRecv.Load() {
+				log.Printf("Stream %d timeout waiting for client close, cleaning up", ss.id)
+				cs.streams.Delete(ss.id)
+			}
+		}()
+	}
 }
 
 // close closes the stream
