@@ -22,17 +22,17 @@ type clientState struct {
 
 // serverStream represents a backend connection for a stream
 type serverStream struct {
-	id               uint32
-	clientIP         net.IP
-	backendConn      net.Conn
-	writeCh          chan []byte // Sequenced write channel
-	closed           atomic.Bool
-	backendClosed    atomic.Bool // Backend read side closed
-	clientCloseRecv  atomic.Bool // Received StreamClose from client
-	bytesIn          atomic.Int64
-	bytesOut         atomic.Int64
-	server           *Server
-	wg               sync.WaitGroup
+	id              uint32
+	clientIP        net.IP
+	backendConn     net.Conn
+	writeCh         chan []byte // Sequenced write channel
+	closed          atomic.Bool
+	backendClosed   atomic.Bool // Backend read side closed
+	clientCloseRecv atomic.Bool // Received StreamClose from client
+	bytesIn         atomic.Int64
+	bytesOut        atomic.Int64
+	server          *Server
+	wg              sync.WaitGroup
 }
 
 // Server represents a shadow-gre server
@@ -43,11 +43,20 @@ type Server struct {
 	transport   *transport.ServerTransport
 	clients     sync.Map // map[string]*clientState
 	closed      atomic.Bool
-	wg          sync.WaitGroup
+	// Worker pool
+	workerChs []chan packetEvent
+	workerWg  sync.WaitGroup
 
-	// Buffer pool for zero-copy
+	wg         sync.WaitGroup
 	bufferPool sync.Pool
 }
+
+type packetEvent struct {
+	clientIP net.IP
+	pkt      tunnel.StreamPacket
+}
+
+const numWorkers = 32
 
 // NewServer creates a new shadow-gre server
 func NewServer(localIP net.IP, backendAddr string, key uint32) *Server {
@@ -70,6 +79,14 @@ func NewServer(localIP net.IP, backendAddr string, key uint32) *Server {
 
 // Start starts the server
 func (s *Server) Start() error {
+	// Start workers
+	s.workerChs = make([]chan packetEvent, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		s.workerChs[i] = make(chan packetEvent, 1024)
+		s.workerWg.Add(1)
+		go s.workerLoop(i)
+	}
+
 	// Create transport
 	trans, err := transport.NewServerTransport(s.localIP, s.key)
 	if err != nil {
@@ -83,12 +100,20 @@ func (s *Server) Start() error {
 	// Start transport
 	s.transport.Start()
 
-	log.Printf("Server listening on %s (GRE protocol), forwarding to %s", s.localIP, s.backendAddr)
+	log.Printf("Server listening on %s (GRE protocol), forwarding to %s (workers: %d)", s.localIP, s.backendAddr, numWorkers)
 
 	return nil
 }
 
-// handleGREPacket processes incoming GRE packets
+// workerLoop processes packets for a specific shard
+func (s *Server) workerLoop(id int) {
+	defer s.workerWg.Done()
+	for evt := range s.workerChs[id] {
+		s.processPacket(evt.clientIP, evt.pkt)
+	}
+}
+
+// handleGREPacket processes incoming GRE packets by dispatching to workers
 func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 	// Parse stream packet (no copy - just parse header and reference data)
 	pkt, err := tunnel.UnmarshalStreamNoCopy(data)
@@ -96,6 +121,23 @@ func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 		return
 	}
 
+	// Dispatch to worker based on StreamID hash
+	// Use a simple modulo hash
+	workerID := pkt.StreamID % numWorkers
+
+	// We must ensure 'data' survives.
+	// tunnel.UnmarshalStreamNoCopy uses slices referencing 'data'.
+	// 'data' is already a copy from transport/server.go, so it's safe to pass to channel.
+
+	select {
+	case s.workerChs[workerID] <- packetEvent{clientIP: clientIP, pkt: *pkt}:
+	default:
+		log.Printf("Worker %d channel full, dropping packet for stream %d", workerID, pkt.StreamID)
+	}
+}
+
+// processPacket handles the actual packet logic
+func (s *Server) processPacket(clientIP net.IP, pkt tunnel.StreamPacket) {
 	// Get or create client state
 	clientKey := clientIP.String()
 	csI, _ := s.clients.LoadOrStore(clientKey, &clientState{
@@ -111,6 +153,7 @@ func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 		ssI, ok := cs.streams.Load(pkt.StreamID)
 		if !ok {
 			// Create new backend connection
+			// This might block (net.Dial), but only blocks this worker
 			ss, err := s.createStream(pkt.StreamID, clientIP, cs)
 			if err != nil {
 				log.Printf("Failed to create stream %d for %s: %v", pkt.StreamID, clientIP, err)
@@ -119,7 +162,9 @@ func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 			// Try to store, if another goroutine already created it, use that one
 			actual, loaded := cs.streams.LoadOrStore(pkt.StreamID, ss)
 			if loaded {
-				// Another goroutine created the stream, close ours and use theirs
+				// Another goroutine (shouldn't happen within same worker shard?)
+				// Actually, if we use hashing by StreamID, only ONE worker handles a given StreamID.
+				// So no race condition on CreateStream for same ID!
 				ss.close()
 				ssI = actual
 			} else {
@@ -150,7 +195,7 @@ func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 			default:
 				// Channel full - backend is too slow, must close stream to avoid blocking receiveLoop
 				log.Printf("Stream %d write channel full (backend too slow), closing stream", pkt.StreamID)
-				go ss.close()  // Close async to avoid blocking
+				go ss.close() // Close async to avoid blocking
 				cs.streams.Delete(pkt.StreamID)
 			}
 		}
@@ -160,7 +205,7 @@ func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 		if ssI, ok := cs.streams.Load(pkt.StreamID); ok {
 			if ss := ssI.(*serverStream); ss != nil {
 				ss.clientCloseRecv.Store(true)
-				ss.close()  // Close backend connection
+				ss.close() // Close backend connection
 
 				// Delete stream if backend also closed, otherwise let readFromBackend handle it
 				if ss.backendClosed.Load() {
@@ -191,8 +236,8 @@ func (s *Server) createStream(streamID uint32, clientIP net.IP, cs *clientState)
 
 	// Start goroutines
 	s.wg.Add(2)
-	go ss.writeToBackend(cs)     // Write to backend (GRE → Backend)
-	go ss.readFromBackend(cs)    // Read from backend (Backend → GRE)
+	go ss.writeToBackend(cs)  // Write to backend (GRE → Backend)
+	go ss.readFromBackend(cs) // Read from backend (Backend → GRE)
 
 	return ss, nil
 }
@@ -278,8 +323,8 @@ func (ss *serverStream) readFromBackend(cs *clientState) {
 // close closes the stream
 func (ss *serverStream) close() {
 	if !ss.closed.Swap(true) {
-		close(ss.writeCh)         // Close write channel
-		ss.backendConn.Close()    // Close backend connection
+		close(ss.writeCh)      // Close write channel
+		ss.backendConn.Close() // Close backend connection
 	}
 }
 
@@ -304,6 +349,14 @@ func (s *Server) Close() error {
 	if s.transport != nil {
 		s.transport.Close()
 	}
+
+	// Close worker channels
+	if s.workerChs != nil {
+		for _, ch := range s.workerChs {
+			close(ch)
+		}
+	}
+	s.workerWg.Wait()
 
 	s.wg.Wait()
 	return nil

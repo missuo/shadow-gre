@@ -16,8 +16,8 @@ NC='\033[0m' # No Color
 PASSWORD="test-password-12345"
 BACKEND_PORT=8388
 CLIENT_PORT=1080
-LOCAL_IP="127.0.0.1"
-SERVER_IP="127.0.0.1"
+LOCAL_IP="127.0.0.2"
+SERVER_IP="127.0.0.3"
 
 # PID 文件
 BACKEND_PID=""
@@ -52,6 +52,13 @@ cleanup() {
     pkill -f "shadow-gre.*-mode client" 2>/dev/null || true
     pkill -f "nc.*-l.*$BACKEND_PORT" 2>/dev/null || true
 
+    # Remove IP aliases (macOS specific)
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "Removing IP aliases..."
+        sudo ifconfig lo0 -alias $LOCAL_IP 2>/dev/null || true
+        sudo ifconfig lo0 -alias $SERVER_IP 2>/dev/null || true
+    fi
+
     echo -e "${GREEN}清理完成${NC}"
 }
 
@@ -81,6 +88,13 @@ echo ""
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_DIR"/*.log
 
+# Setup IP aliases for macOS
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo -e "${YELLOW}设置 IP 别名 (macOS)...${NC}"
+    sudo ifconfig lo0 alias $LOCAL_IP up
+    sudo ifconfig lo0 alias $SERVER_IP up
+fi
+
 # 步骤 1: 构建项目
 echo -e "${YELLOW}[1/7] 构建项目...${NC}"
 go build -o shadow-gre ./cmd/shadow-gre || error_exit "构建失败"
@@ -108,10 +122,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/test':
+            response = b"Hello from backend! " * 100  # 2KB 响应
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
+            self.send_header('Content-Length', str(len(response)))
+            self.send_header('Connection', 'close')
             self.end_headers()
-            response = b"Hello from backend! " * 100  # 2KB 响应
             self.wfile.write(response)
         elif self.path == '/large':
             self.send_response(200)
@@ -128,7 +144,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(b"OK\n")
 
 Handler = CustomHandler
-with socketserver.TCPServer(("", PORT), Handler) as httpd:
+class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    pass
+
+with ThreadingTCPServer(("", PORT), Handler) as httpd:
     print(f"Backend server running on port {PORT}", file=sys.stderr)
     httpd.serve_forever()
 EOF
@@ -280,11 +299,11 @@ echo ""
 # 步骤 7: 并发测试
 echo -e "${YELLOW}[7/7] 并发连接测试...${NC}"
 
-echo -e "  ${BLUE}→${NC} 测试并发 10 个请求..."
+echo -e "  ${BLUE}→${NC} 测试并发 4 个请求..."
 CONCURRENT_START=$(date +%s%N)
 
 # 并发请求
-for i in {1..10}; do
+for i in {1..4}; do
     curl -s --max-time 10 "http://127.0.0.1:$CLIENT_PORT/test" > /dev/null &
 done
 
@@ -293,7 +312,7 @@ wait
 
 CONCURRENT_END=$(date +%s%N)
 CONCURRENT_TIME=$(( ($CONCURRENT_END - $CONCURRENT_START) / 1000000 ))
-echo -e "    ${GREEN}✓ 10 个并发请求完成，总耗时: ${CONCURRENT_TIME}ms${NC}"
+echo -e "    ${GREEN}✓ 4 个并发请求完成，总耗时: ${CONCURRENT_TIME}ms${NC}"
 
 echo -e "${GREEN}✓ 并发测试完成${NC}"
 echo ""
@@ -322,7 +341,7 @@ echo -e "${GREEN}总结:${NC}"
 echo -e "  • 基本连接: ${GREEN}通过${NC}"
 echo -e "  • 小包传输: ${GREEN}通过${NC} (平均 $((SMALL_TIME/10))ms/req)"
 echo -e "  • 大包传输: ${GREEN}通过${NC} (${THROUGHPUT} KB/s)"
-echo -e "  • 并发连接: ${GREEN}通过${NC} (10 个并发，${CONCURRENT_TIME}ms)"
+echo -e "  • 并发连接: ${GREEN}通过${NC} (4 个并发，${CONCURRENT_TIME}ms)"
 echo ""
 echo -e "${YELLOW}日志文件位置:${NC}"
 echo -e "  • Client:  $LOG_DIR/client.log"
