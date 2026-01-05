@@ -1,0 +1,32 @@
+services:
+  # Example: Shadowsocks server (backend service)
+  ssserver-rust:
+    container_name: ssserver-rust
+    image: ghcr.io/shadowsocks/ssserver-rust:latest
+    restart: always
+    network_mode: "host"
+    volumes:
+      - ./config.json:/etc/shadowsocks-rust/config.json
+
+  # shadow-gre server mode
+  # Receives GRE traffic and forwards to backend
+  shadow-gre:
+    build: .
+    container_name: shadow-gre
+    restart: always
+    network_mode: "host"
+    cap_add:
+      - NET_RAW      # Required for raw sockets
+      - NET_ADMIN    # Required for GRE protocol access
+    environment:
+      - MODE=server
+      - LOCAL=0.0.0.0
+      - BACKEND=127.0.0.1:8388
+      - PASSWORD=CHANGE_ME
+    command: >
+      -mode server
+      -local 0.0.0.0
+      -backend 127.0.0.1:8388
+      -password ${PASSWORD:-CHANGE_ME}
+    depends_on:
+      - ssserver-rust

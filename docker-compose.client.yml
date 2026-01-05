@@ -1,0 +1,17 @@
+services:
+  # shadow-gre client mode
+  # Listens for TCP and forwards via GRE to server
+  shadow-gre:
+    build: .
+    container_name: shadow-gre-client
+    restart: always
+    network_mode: "host"
+    cap_add:
+      - NET_RAW      # Required for raw sockets
+      - NET_ADMIN    # Required for GRE protocol access
+    command: >
+      -mode client
+      -listen 0.0.0.0:1080
+      -local 0.0.0.0
+      -remote ${SERVER_IP}
+      -password ${PASSWORD:-CHANGE_ME}

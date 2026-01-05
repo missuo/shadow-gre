@@ -1,8 +1,8 @@
 # shadow-gre
 
-TCP over GRE tunnel - Encapsulate TCP traffic into GRE protocol (IP Protocol 47) for transmission.
+TCP over GRE 隧道 - 将 TCP 流量封装成 GRE 协议（IP Protocol 47）进行传输。
 
-## Architecture
+## 架构
 
 ```
 ┌─────────────────┐                                    ┌─────────────────┐
@@ -17,31 +17,31 @@ TCP over GRE tunnel - Encapsulate TCP traffic into GRE protocol (IP Protocol 47)
 └─────────────────┘                                    └──────────────────┘
 ```
 
-## Features
+## 特性
 
-- Uses real GRE protocol (IP Protocol 47)
-- Supports multiple connection multiplexing
-- Simple authentication via GRE Key field
-- Docker deployment support
+- 使用真正的 GRE 协议（IP Protocol 47）
+- 支持多连接复用
+- 简单的密码认证（通过 GRE Key 字段）
+- Docker 部署支持
 
-## Requirements
+## 要求
 
 - Go 1.21+
-- Linux (macOS theoretically supported but requires root)
-- Root/sudo privileges (required for raw sockets)
-- Network environment that allows GRE protocol
+- Linux 系统（macOS 理论上支持但需要 root）
+- Root/sudo 权限（raw socket 需要）
+- 网络环境允许 GRE 协议通过
 
-## Build
+## 编译
 
 ```bash
 go build -o shadow-gre ./cmd/shadow-gre
 ```
 
-## Usage
+## 使用方法
 
-### Server Mode
+### Server 模式
 
-Run on the server side to receive GRE traffic and forward to backend services:
+在服务端运行，接收 GRE 流量并转发到后端服务：
 
 ```bash
 sudo ./shadow-gre \
@@ -51,9 +51,9 @@ sudo ./shadow-gre \
   -password YOUR_PASSWORD
 ```
 
-### Client Mode
+### Client 模式
 
-Run on the client side to listen for TCP connections and forward via GRE to the server:
+在客户端运行，监听 TCP 连接并通过 GRE 转发到服务器：
 
 ```bash
 sudo ./shadow-gre \
@@ -64,45 +64,45 @@ sudo ./shadow-gre \
   -password YOUR_PASSWORD
 ```
 
-### Parameters
+### 参数说明
 
-| Parameter | Description |
-|-----------|-------------|
-| `-mode` | Running mode: `client` or `server` |
-| `-listen` | TCP listen address (client mode only) |
-| `-local` | Local IP address for GRE socket binding |
-| `-remote` | Server IP address (client mode only) |
-| `-backend` | Backend service address (server mode only) |
-| `-password` | Shared password for generating GRE Key |
+| 参数 | 说明 |
+|------|------|
+| `-mode` | 运行模式：`client` 或 `server` |
+| `-listen` | TCP 监听地址（仅 client 模式） |
+| `-local` | 本地 IP 地址，用于绑定 GRE socket |
+| `-remote` | 服务器 IP 地址（仅 client 模式） |
+| `-backend` | 后端服务地址（仅 server 模式） |
+| `-password` | 共享密码，用于生成 GRE Key |
 
-## Docker Deployment
+## Docker 部署
 
-### Server Side
+### Server 端
 
 ```bash
-# Set password
+# 编辑密码
 export PASSWORD=your_secure_password
 
-# Start
+# 启动
 docker-compose -f docker-compose.server.yml up -d
 ```
 
-### Client Side
+### Client 端
 
 ```bash
-# Set server IP and password
+# 设置服务器 IP 和密码
 export SERVER_IP=your_server_ip
 export PASSWORD=your_secure_password
 
-# Start
+# 启动
 docker-compose -f docker-compose.client.yml up -d
 ```
 
-## Example with Shadowsocks
+## 配合 Shadowsocks 使用示例
 
-### Server Configuration
+### 服务端配置
 
-1. Create Shadowsocks config file `config.json`:
+1. 创建 Shadowsocks 配置文件 `config.json`:
 
 ```json
 {
@@ -113,25 +113,25 @@ docker-compose -f docker-compose.client.yml up -d
 }
 ```
 
-2. Start using docker-compose.server.yml
+2. 使用 docker-compose.server.yml 启动
 
-### Client Configuration
+### 客户端配置
 
-1. Start shadow-gre client listening on port 1080
-2. Configure Shadowsocks client to connect to 127.0.0.1:1080
+1. 启动 shadow-gre client，监听 1080 端口
+2. 配置 Shadowsocks 客户端连接 127.0.0.1:1080
 
-## Important Notes
+## 注意事项
 
-1. **Root Privileges Required**: Raw socket operations require root/sudo privileges
-2. **Firewall**: Ensure firewall allows GRE protocol (IP Protocol 47)
-3. **NAT Issues**: GRE is an IP layer protocol, some NAT devices may not support it
-4. **Docker Permissions**: Requires `NET_RAW` and `NET_ADMIN` capabilities
+1. **需要 Root 权限**: Raw socket 操作需要 root/sudo 权限
+2. **防火墙**: 确保防火墙允许 GRE 协议（IP Protocol 47）通过
+3. **NAT 问题**: GRE 是 IP 层协议，某些 NAT 设备可能不支持
+4. **Docker 权限**: 需要 `NET_RAW` 和 `NET_ADMIN` capabilities
 
-## Protocol Specification
+## 协议说明
 
-### GRE Header Format
+### GRE 头部格式
 
-Uses standard GRE format (RFC 2784 + RFC 2890):
+使用标准 GRE 格式（RFC 2784 + RFC 2890）：
 
 ```
  0                   1                   2                   3
@@ -147,9 +147,9 @@ Uses standard GRE format (RFC 2784 + RFC 2890):
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-### Tunnel Frame Format
+### 隧道帧格式
 
-Custom frame format in GRE payload for connection multiplexing:
+在 GRE 载荷中使用自定义帧格式进行连接复用：
 
 ```
  0                   1                   2                   3
@@ -163,15 +163,15 @@ Custom frame format in GRE payload for connection multiplexing:
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-Frame Types:
-- `0x00`: DATA - Data frame
-- `0x01`: SYN - Connection establishment
-- `0x02`: SYN-ACK - Connection acknowledgment
-- `0x03`: FIN - Connection close
-- `0x04`: FIN-ACK - Close acknowledgment
-- `0x05`: PING - Heartbeat
-- `0x06`: PONG - Heartbeat response
+帧类型：
+- `0x00`: DATA - 数据帧
+- `0x01`: SYN - 连接建立
+- `0x02`: SYN-ACK - 连接确认
+- `0x03`: FIN - 连接关闭
+- `0x04`: FIN-ACK - 关闭确认
+- `0x05`: PING - 心跳
+- `0x06`: PONG - 心跳响应
 
-## License
+## 许可证
 
 MIT
