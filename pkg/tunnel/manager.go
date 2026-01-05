@@ -134,7 +134,9 @@ func (c *Connection) flushLocked() {
 		return
 	}
 
-	data := c.writeBuf.Bytes()
+	// Must copy data before Reset, as Bytes() returns underlying slice
+	data := make([]byte, c.writeBuf.Len())
+	copy(data, c.writeBuf.Bytes())
 	c.writeBuf.Reset()
 
 	seq := c.seq.Add(1)
