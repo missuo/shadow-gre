@@ -16,7 +16,7 @@ const (
 	// WriteFlushInterval is the max time to hold data before flushing
 	WriteFlushInterval = 1 * time.Millisecond
 	// ReadChannelSize is the size of read channel buffer
-	ReadChannelSize = 1024
+	ReadChannelSize = 4096
 	// DialTimeout is the timeout for connection establishment
 	DialTimeout = 5 * time.Second
 )
@@ -208,7 +208,7 @@ func (c *Connection) Close() error {
 	return nil
 }
 
-// deliver delivers data to the connection's read buffer
+// deliver delivers data to the connection's read buffer (non-blocking)
 func (c *Connection) deliver(data []byte) {
 	if c.closed.Load() {
 		return
@@ -217,9 +217,13 @@ func (c *Connection) deliver(data []byte) {
 	buf := make([]byte, len(data))
 	copy(buf, data)
 
+	// Non-blocking send - if buffer is full, drop the packet
+	// This is acceptable because GRE is unreliable and upper layer (TCP) will retransmit
 	select {
 	case c.readCh <- buf:
 	case <-c.closeCh:
+	default:
+		// Buffer full, drop packet
 	}
 }
 
