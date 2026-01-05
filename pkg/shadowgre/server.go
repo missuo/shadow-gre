@@ -24,11 +24,12 @@ type serverStream struct {
 	id          uint32
 	clientIP    net.IP
 	backendConn net.Conn
-	writeMu     sync.Mutex
+	writeCh     chan []byte // Sequenced write channel
 	closed      atomic.Bool
 	bytesIn     atomic.Int64
 	bytesOut    atomic.Int64
 	server      *Server
+	wg          sync.WaitGroup
 }
 
 // Server represents a shadow-gre server
@@ -128,17 +129,18 @@ func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 			return
 		}
 
-		// Write data to backend
+		// Queue data for async write to backend (must copy!)
 		if len(pkt.Data) > 0 {
-			ss.writeMu.Lock()
-			n, err := ss.backendConn.Write(pkt.Data)
-			ss.writeMu.Unlock()
+			data := make([]byte, len(pkt.Data))
+			copy(data, pkt.Data)
 
-			if err != nil {
-				ss.close()
-				return
+			select {
+			case ss.writeCh <- data:
+				// Queued successfully
+			default:
+				// Channel full, drop packet (this shouldn't happen with large buffer)
+				log.Printf("Stream %d write channel full, dropping %d bytes", pkt.StreamID, len(pkt.Data))
 			}
-			ss.bytesOut.Add(int64(n))
 		}
 
 	case tunnel.StreamClose:
@@ -164,16 +166,33 @@ func (s *Server) createStream(streamID uint32, clientIP net.IP, cs *clientState)
 		id:          streamID,
 		clientIP:    clientIP,
 		backendConn: backendConn,
+		writeCh:     make(chan []byte, 256), // Buffered channel for async writes
 		server:      s,
 	}
 
 	log.Printf("Stream %d from %s forwarding to %s", streamID, clientIP, s.backendAddr)
 
-	// Start reading from backend
-	s.wg.Add(1)
-	go ss.readFromBackend(cs)
+	// Start goroutines
+	s.wg.Add(2)
+	go ss.writeToBackend(cs)     // Write to backend (GRE → Backend)
+	go ss.readFromBackend(cs)    // Read from backend (Backend → GRE)
 
 	return ss, nil
+}
+
+// writeToBackend writes data from GRE to backend (async, preserves order)
+func (ss *serverStream) writeToBackend(cs *clientState) {
+	defer ss.server.wg.Done()
+
+	for data := range ss.writeCh {
+		n, err := ss.backendConn.Write(data)
+		if err != nil {
+			log.Printf("Stream %d backend write error: %v", ss.id, err)
+			ss.close()
+			return
+		}
+		ss.bytesOut.Add(int64(n))
+	}
 }
 
 // readFromBackend reads data from backend and sends to client via GRE
@@ -228,7 +247,8 @@ func (ss *serverStream) readFromBackend(cs *clientState) {
 // close closes the stream
 func (ss *serverStream) close() {
 	if !ss.closed.Swap(true) {
-		ss.backendConn.Close()
+		close(ss.writeCh)         // Close write channel
+		ss.backendConn.Close()    // Close backend connection
 	}
 }
 
