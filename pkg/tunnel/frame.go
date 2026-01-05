@@ -21,9 +21,6 @@ const (
 	// MinFrameSize is the minimum frame header size
 	// Type (1) + ConnID (4) + Seq (4) + Length (2) = 11 bytes
 	MinFrameSize = 11
-
-	// MaxPayloadSize is the maximum payload size
-	MaxPayloadSize = 65000
 )
 
 var (

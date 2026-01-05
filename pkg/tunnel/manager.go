@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	// WriteBufferSize is the size of write buffer before flushing
-	WriteBufferSize = 8192
+	// MaxPayloadSize is the maximum payload per GRE packet (MTU - IP header - GRE header - frame header)
+	// MTU(1500) - IP(20) - GRE(12) - Frame(11) = 1457, use 1400 for safety
+	MaxPayloadSize = 1400
 	// WriteFlushInterval is the max time to hold data before flushing
 	WriteFlushInterval = 1 * time.Millisecond
 	// ReadChannelSize is the size of read channel buffer
@@ -137,7 +138,7 @@ func (c *Connection) Write(p []byte) (n int, err error) {
 	n, _ = c.writeBuf.Write(p)
 
 	// Flush immediately if buffer is large enough
-	if c.writeBuf.Len() >= WriteBufferSize {
+	if c.writeBuf.Len() >= MaxPayloadSize {
 		c.flushLocked()
 		return n, nil
 	}
@@ -161,18 +162,20 @@ func (c *Connection) flushLocked() {
 		c.flushTimer = nil
 	}
 
-	if c.writeBuf.Len() == 0 {
-		return
+	// Send in chunks that fit within MTU
+	for c.writeBuf.Len() > 0 {
+		size := c.writeBuf.Len()
+		if size > MaxPayloadSize {
+			size = MaxPayloadSize
+		}
+
+		data := make([]byte, size)
+		c.writeBuf.Read(data)
+
+		seq := c.seq.Add(1)
+		frame := NewDataFrame(c.ID, seq, data)
+		c.manager.sendFrame(frame)
 	}
-
-	// Must copy data before Reset
-	data := make([]byte, c.writeBuf.Len())
-	copy(data, c.writeBuf.Bytes())
-	c.writeBuf.Reset()
-
-	seq := c.seq.Add(1)
-	frame := NewDataFrame(c.ID, seq, data)
-	c.manager.sendFrame(frame)
 }
 
 // Flush forces a flush of the write buffer
