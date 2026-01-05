@@ -5,6 +5,10 @@
 *.so
 *.dylib
 
+# Ignore binary in root but allow cmd/shadow-gre directory
+/shadow-gre
+!/cmd/shadow-gre/
+
 # Test binary
 *.test
 

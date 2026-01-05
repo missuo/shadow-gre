@@ -104,16 +104,23 @@ func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
 	switch pkt.Flags {
 	case tunnel.StreamData:
 		// Get or create stream
-		ssI, loaded := cs.streams.LoadOrStore(pkt.StreamID, nil)
-		if !loaded || ssI == nil {
+		ssI, ok := cs.streams.Load(pkt.StreamID)
+		if !ok {
 			// Create new backend connection
 			ss, err := s.createStream(pkt.StreamID, clientIP, cs)
 			if err != nil {
 				log.Printf("Failed to create stream %d for %s: %v", pkt.StreamID, clientIP, err)
 				return
 			}
-			cs.streams.Store(pkt.StreamID, ss)
-			ssI = ss
+			// Try to store, if another goroutine already created it, use that one
+			actual, loaded := cs.streams.LoadOrStore(pkt.StreamID, ss)
+			if loaded {
+				// Another goroutine created the stream, close ours and use theirs
+				ss.close()
+				ssI = actual
+			} else {
+				ssI = ss
+			}
 		}
 
 		ss := ssI.(*serverStream)

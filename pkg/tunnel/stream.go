@@ -55,7 +55,9 @@ func UnmarshalStream(data []byte) (*StreamPacket, error) {
 	}
 
 	if len(data) > StreamHeaderSize {
-		p.Data = data[StreamHeaderSize:]
+		// Must copy data to avoid buffer reuse issues
+		p.Data = make([]byte, len(data)-StreamHeaderSize)
+		copy(p.Data, data[StreamHeaderSize:])
 	}
 
 	return p, nil
