@@ -15,7 +15,10 @@ import (
 
 const (
 	copyBufferSize = 64 * 1024 // 64KB buffer for io.Copy
-	greBufferSize  = 2048      // Buffer for GRE packets (MTU + headers)
+	// maxReadSize must fit in MTU: 1500 - IP(20) - GRE(12) - StreamHeader(5) = 1463
+	// Use 1400 for safety margin
+	maxReadSize = 1400
+	greBufferSize = maxReadSize + tunnel.StreamHeaderSize
 )
 
 // streamConn represents an active TCP connection
@@ -148,8 +151,8 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	defer c.bufferPool.Put(bufPtr)
 
 	for {
-		// Read from TCP
-		n, err := tcpConn.Read(buf[tunnel.StreamHeaderSize:])
+		// Read from TCP (limit to maxReadSize to respect MTU)
+		n, err := tcpConn.Read(buf[tunnel.StreamHeaderSize : tunnel.StreamHeaderSize+maxReadSize])
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Stream %d read error: %v", streamID, err)
