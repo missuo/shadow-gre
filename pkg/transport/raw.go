@@ -3,6 +3,7 @@ package transport
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -12,15 +13,17 @@ import (
 
 // RawTransport handles raw socket communication for GRE packets
 type RawTransport struct {
-	localIP   net.IP
-	remoteIP  net.IP
-	conn      *net.IPConn
-	key       uint32
-	seq       atomic.Uint32
-	onReceive func([]byte)
-	closed    atomic.Bool
-	closeCh   chan struct{}
-	wg        sync.WaitGroup
+	localIP     net.IP
+	remoteIP    net.IP
+	conn        *net.IPConn
+	key         uint32
+	seq         atomic.Uint32
+	onReceive   func([]byte)
+	closed      atomic.Bool
+	closeCh     chan struct{}
+	wg          sync.WaitGroup
+	recvCount   atomic.Uint64
+	sendCount   atomic.Uint64
 }
 
 // NewRawTransport creates a new raw socket transport
@@ -63,6 +66,9 @@ func (t *RawTransport) Send(payload []byte) error {
 
 	// Send to remote IP
 	_, err := t.conn.WriteToIP(greData, &net.IPAddr{IP: t.remoteIP})
+	if err == nil {
+		t.sendCount.Add(1)
+	}
 	return err
 }
 
@@ -71,8 +77,12 @@ func (t *RawTransport) receiveLoop() {
 	defer t.wg.Done()
 
 	buf := make([]byte, 65535)
+	var totalRecv, filtered, keyMismatch, delivered uint64
+
 	for {
 		if t.closed.Load() {
+			log.Printf("Transport stats: total_recv=%d, filtered=%d, key_mismatch=%d, delivered=%d, sent=%d",
+				totalRecv, filtered, keyMismatch, delivered, t.sendCount.Load())
 			return
 		}
 
@@ -84,8 +94,11 @@ func (t *RawTransport) receiveLoop() {
 			continue
 		}
 
+		totalRecv++
+
 		// Filter packets from our peer
 		if t.remoteIP != nil && !addr.IP.Equal(t.remoteIP) {
+			filtered++
 			continue
 		}
 
@@ -97,15 +110,17 @@ func (t *RawTransport) receiveLoop() {
 
 		// Verify key
 		if packet.Header.Key != t.key {
+			keyMismatch++
 			continue
 		}
 
 		// Deliver payload to handler
 		if t.onReceive != nil && len(packet.Payload) > 0 {
-			// Make a copy of the payload
 			payload := make([]byte, len(packet.Payload))
 			copy(payload, packet.Payload)
 			t.onReceive(payload)
+			delivered++
+			t.recvCount.Add(1)
 		}
 	}
 }

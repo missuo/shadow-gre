@@ -120,11 +120,14 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	var bytesToTunnel, bytesFromTunnel int64
+
 	// TCP -> Tunnel
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, copyBufferSize)
-		io.CopyBuffer(tunnelConn, tcpConn, buf)
+		n, _ := io.CopyBuffer(tunnelConn, tcpConn, buf)
+		bytesToTunnel = n
 		tunnelConn.Close()
 	}()
 
@@ -132,12 +135,13 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, copyBufferSize)
-		io.CopyBuffer(tcpConn, tunnelConn, buf)
+		n, _ := io.CopyBuffer(tcpConn, tunnelConn, buf)
+		bytesFromTunnel = n
 		tcpConn.Close()
 	}()
 
 	wg.Wait()
-	log.Printf("Connection closed, tunnel ID: %d", tunnelConn.ID)
+	log.Printf("Connection closed, tunnel ID: %d (to_tunnel: %d bytes, from_tunnel: %d bytes)", tunnelConn.ID, bytesToTunnel, bytesFromTunnel)
 }
 
 // Close closes the client
