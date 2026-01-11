@@ -211,13 +211,6 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 		}
 	}
 
-	// If server already closed, signal writer to drain
-	// Give a small delay to allow any in-flight GRE packets to arrive
-	if sc.serverClosed.Load() {
-		time.Sleep(50 * time.Millisecond)
-		sc.signalClose()
-	}
-
 	// Wait for writer to finish (server close or timeout)
 	select {
 	case <-sc.writerDone:
@@ -251,12 +244,17 @@ func (sc *streamConn) writeLoop() {
 			if _, err := sc.conn.Write(data); err != nil {
 				// Write error, drain channel and exit
 				log.Printf("Stream %d: TCP write error: %v", sc.id, err)
+				sc.closed.Store(true)
 				sc.drainWriteCh()
 				return
 			}
 			sc.bytesIn.Add(int64(len(data)))
 		case <-sc.closeCh:
-			// Close signal received, drain remaining data then exit
+			// Close signal received
+			// Wait briefly for any in-flight GRE packets to be queued
+			time.Sleep(50 * time.Millisecond)
+			// Now block new data and drain
+			sc.closed.Store(true)
 			log.Printf("Stream %d: writeLoop received close signal, draining", sc.id)
 			sc.drainWriteCh()
 			return
@@ -284,9 +282,9 @@ func (sc *streamConn) drainWriteCh() {
 	}
 }
 
-// signalClose signals the writer to stop accepting new data and drain remaining
+// signalClose signals the writer to drain and exit
+// Does NOT set closed immediately - allows in-flight data to be queued
 func (sc *streamConn) signalClose() {
-	sc.closed.Store(true)
 	select {
 	case <-sc.closeCh:
 	default:
@@ -296,6 +294,7 @@ func (sc *streamConn) signalClose() {
 
 // close fully closes the stream connection (for error cases)
 func (sc *streamConn) close() {
+	sc.closed.Store(true)
 	sc.signalClose()
 	sc.conn.Close()
 }
@@ -342,10 +341,10 @@ func (c *Client) handleGREPacket(data []byte) {
 
 	case tunnel.StreamClose:
 		// Server closed the stream
-		// Only set serverClosed - let handleConnection handle the close sequence
-		// This allows any remaining data packets to be queued before signalClose
 		log.Printf("Stream %d: received StreamClose from server", pkt.StreamID)
 		sc.serverClosed.Store(true)
+		// Signal writer to drain - it will wait 50ms for in-flight packets before setting closed
+		sc.signalClose()
 	}
 }
 
