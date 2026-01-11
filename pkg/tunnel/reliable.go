@@ -24,13 +24,14 @@ const (
 	MaxSackBlocks         = 4 // Maximum SACK blocks per packet
 
 	// Protocol parameters
-	DefaultWindowSize   = 128            // Maximum unacked packets
-	DefaultRTOMs        = 200            // Initial retransmission timeout in ms
-	MinRTOMs            = 50             // Minimum RTO
-	MaxRTOMs            = 3000           // Maximum RTO
-	MaxRetries          = 15             // Max retransmission attempts
-	AckDelayMs          = 10             // Delay before sending pure ACK
-	MaxOutOfOrderBuffer = 512            // Max out-of-order packets to buffer
+	DefaultWindowSize   = 512            // Maximum unacked packets (larger for high throughput)
+	DefaultRTOMs        = 100            // Initial retransmission timeout in ms
+	MinRTOMs            = 20             // Minimum RTO
+	MaxRTOMs            = 2000           // Maximum RTO
+	MaxRetries          = 20             // Max retransmission attempts
+	AckDelayMs          = 2              // Delay before sending pure ACK
+	AckEveryN           = 2              // Send ACK every N packets (like TCP delayed ACK)
+	MaxOutOfOrderBuffer = 1024           // Max out-of-order packets to buffer
 	CleanupIntervalMs   = 5000           // Stream cleanup interval
 	FastRetransmitCount = 3              // Duplicate ACKs before fast retransmit
 
@@ -304,9 +305,10 @@ type ReliableStream struct {
 	rttEstimator *RTTEstimator
 
 	// ACK coalescing
-	pendingAck atomic.Bool
-	ackTimer   *time.Timer
-	ackMu      sync.Mutex
+	pendingAck   atomic.Bool
+	ackTimer     *time.Timer
+	ackMu        sync.Mutex
+	recvCounter  atomic.Uint32 // Counter for ACK every N packets
 
 	// Stats
 	retransmits atomic.Uint64
@@ -606,8 +608,19 @@ func (rs *ReliableStream) deliverOutOfOrder() {
 	}
 }
 
-// scheduleAck schedules a delayed ACK
+// scheduleAck schedules a delayed ACK or sends immediately every N packets
 func (rs *ReliableStream) scheduleAck() {
+	// Increment receive counter and check if we should ACK immediately
+	count := rs.recvCounter.Add(1)
+	if count%AckEveryN == 0 {
+		// Send ACK immediately every N packets
+		rs.pendingAck.Store(false)
+		rs.cancelAckTimer()
+		rs.sendAckNow()
+		return
+	}
+
+	// Otherwise schedule delayed ACK
 	if rs.pendingAck.Swap(true) {
 		return // Already scheduled
 	}
@@ -675,7 +688,7 @@ func (rs *ReliableStream) sendAckWithSack() {
 
 // retransmitLoop handles retransmissions
 func (rs *ReliableStream) retransmitLoop() {
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
