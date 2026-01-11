@@ -15,27 +15,22 @@ import (
 )
 
 const (
-	copyBufferSize = 64 * 1024 // 64KB buffer for io.Copy
 	// maxReadSize must fit in MTU: 1500 - IP(20) - GRE(8) - ReliableHeader(13+SACK) = ~1450
 	// Use 1300 for safety margin with reliable headers and SACK blocks
 	maxReadSize = 1300
-	// GRE header size with Key flag: 4(base) + 4(key) = 8
-	greHeaderSize = 8
 	// greBufferSize needs to fit: GRE(8) + ReliableHeader(~45) + Data(1300) = ~1353
 	// Round up for alignment
 	greBufferSize = 1400
-	// Maximum reliable header size: 9 + 4(ACK) + 1 + 4*8(SACK) = 46
-	maxReliableHeaderSize = 46
 )
 
 // streamConn represents an active TCP connection
 type streamConn struct {
 	id           uint32
 	conn         net.Conn
-	writeCh      chan []byte    // Async write channel (from GRE to TCP)
-	closeCh      chan struct{}  // Signal to stop accepting new data
-	writerDone   chan struct{}  // Signal that writer has finished
-	serverClosed atomic.Bool    // Server sent StreamClose
+	writeCh      chan []byte   // Async write channel (from GRE to TCP)
+	closeCh      chan struct{} // Signal to stop accepting new data
+	writerDone   chan struct{} // Signal that writer has finished
+	serverClosed atomic.Bool   // Server sent StreamClose
 	closed       atomic.Bool
 	bytesIn      atomic.Int64
 	bytesOut     atomic.Int64
