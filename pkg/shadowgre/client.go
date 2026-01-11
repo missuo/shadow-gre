@@ -28,13 +28,15 @@ const (
 
 // streamConn represents an active TCP connection
 type streamConn struct {
-	id       uint32
-	conn     net.Conn
-	writeMu  sync.Mutex
-	closed   atomic.Bool
-	bytesIn  atomic.Int64
-	bytesOut atomic.Int64
-	closedCh chan struct{} // Closed when stream should be cleaned up
+	id            uint32
+	conn          net.Conn
+	writeCh       chan []byte   // Async write channel
+	closeCh       chan struct{} // Signal to stop accepting new data
+	writerDone    chan struct{} // Signal that writer has finished
+	serverClosed  atomic.Bool   // Server sent StreamClose
+	closed        atomic.Bool
+	bytesIn       atomic.Int64
+	bytesOut      atomic.Int64
 }
 
 // Client represents a shadow-gre client
@@ -136,21 +138,25 @@ func (c *Client) acceptLoop() {
 // handleConnection handles a single TCP connection
 func (c *Client) handleConnection(tcpConn net.Conn) {
 	defer c.wg.Done()
-	defer tcpConn.Close()
 
 	// Allocate stream ID
 	streamID := c.nextStreamID.Add(1)
 
 	// Create stream connection
 	sc := &streamConn{
-		id:       streamID,
-		conn:     tcpConn,
-		closedCh: make(chan struct{}),
+		id:         streamID,
+		conn:       tcpConn,
+		writeCh:    make(chan []byte, 4096), // Larger buffer for throughput
+		closeCh:    make(chan struct{}),
+		writerDone: make(chan struct{}),
 	}
 	c.streams.Store(streamID, sc)
 	defer c.streams.Delete(streamID)
 
 	log.Printf("New connection from %s, stream ID: %d", tcpConn.RemoteAddr(), streamID)
+
+	// Start writer goroutine (GRE → TCP)
+	go sc.writeLoop()
 
 	// TCP → GRE (read from TCP, send to GRE)
 	bufPtr := c.bufferPool.Get().(*[]byte)
@@ -158,11 +164,22 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	defer c.bufferPool.Put(bufPtr)
 
 	for {
+		// Set read deadline to allow checking for server close
+		tcpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+
 		// Reserve space for GRE header at the beginning, then Stream header
 		// Layout: [GRE header (8)][Stream header (5)][TCP data (up to 1400)]
 		dataOffset := greHeaderSize + tunnel.StreamHeaderSize
 		n, err := tcpConn.Read(buf[dataOffset : dataOffset+maxReadSize])
 		if err != nil {
+			// Check if server closed the stream
+			if sc.serverClosed.Load() {
+				break
+			}
+			// Check for timeout (not a real error, just checking for server close)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			if err != io.EOF {
 				log.Printf("Stream %d read error: %v", streamID, err)
 			}
@@ -187,22 +204,87 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	}
 
 	// Send close packet to notify server (half-close)
-	closePkt := tunnel.NewClosePacket(streamID)
-	if closeData := closePkt.Marshal(); len(closeData) > 0 {
-		c.transport.Send(closeData)
+	if !sc.serverClosed.Load() {
+		closePkt := tunnel.NewClosePacket(streamID)
+		if closeData := closePkt.Marshal(); len(closeData) > 0 {
+			c.transport.Send(closeData)
+		}
 	}
 
-	// Wait for server to close the stream or timeout
+	// Wait for writer to finish (server close or timeout)
 	select {
-	case <-sc.closedCh:
-		// Server closed the stream
+	case <-sc.writerDone:
+		// Writer finished, all data written
 	case <-time.After(30 * time.Second):
 		// Timeout waiting for server close
 		log.Printf("Stream %d timeout waiting for server close", streamID)
+		sc.signalClose()
+		<-sc.writerDone
 	}
+
+	// Now safe to close TCP connection
+	tcpConn.Close()
 
 	log.Printf("Connection closed, stream ID: %d (sent: %d bytes, recv: %d bytes)",
 		streamID, sc.bytesOut.Load(), sc.bytesIn.Load())
+}
+
+// writeLoop writes data from writeCh to TCP connection
+func (sc *streamConn) writeLoop() {
+	defer close(sc.writerDone)
+
+	for {
+		select {
+		case data, ok := <-sc.writeCh:
+			if !ok {
+				return
+			}
+			if _, err := sc.conn.Write(data); err != nil {
+				// Write error, drain channel and exit
+				sc.drainWriteCh()
+				return
+			}
+			sc.bytesIn.Add(int64(len(data)))
+		case <-sc.closeCh:
+			// Close signal received, drain remaining data then exit
+			sc.drainWriteCh()
+			return
+		}
+	}
+}
+
+// drainWriteCh writes all remaining data in writeCh
+func (sc *streamConn) drainWriteCh() {
+	for {
+		select {
+		case data, ok := <-sc.writeCh:
+			if !ok {
+				return
+			}
+			if _, err := sc.conn.Write(data); err != nil {
+				return
+			}
+			sc.bytesIn.Add(int64(len(data)))
+		default:
+			return
+		}
+	}
+}
+
+// signalClose signals the writer to stop accepting new data and drain remaining
+func (sc *streamConn) signalClose() {
+	sc.closed.Store(true)
+	select {
+	case <-sc.closeCh:
+	default:
+		close(sc.closeCh)
+	}
+}
+
+// close fully closes the stream connection (for error cases)
+func (sc *streamConn) close() {
+	sc.signalClose()
+	sc.conn.Close()
 }
 
 // handleGREPacket processes incoming GRE packets
@@ -224,29 +306,30 @@ func (c *Client) handleGREPacket(data []byte) {
 	// Handle based on flags
 	switch pkt.Flags {
 	case tunnel.StreamData:
-		// Write data to TCP connection
-		if len(pkt.Data) > 0 {
-			sc.writeMu.Lock()
-			n, err := sc.conn.Write(pkt.Data)
-			sc.writeMu.Unlock()
-
-			if err != nil {
-				sc.conn.Close()
-				return
+		// Queue data to write channel (non-blocking with timeout)
+		if len(pkt.Data) > 0 && !sc.closed.Load() {
+			// pkt.Data is already copied by UnmarshalStream
+			select {
+			case sc.writeCh <- pkt.Data:
+				// Queued successfully
+			case <-sc.closeCh:
+				// Stream closing, but still try to queue
+				select {
+				case sc.writeCh <- pkt.Data:
+				default:
+				}
+			case <-time.After(5 * time.Second):
+				// Timeout - TCP write is too slow
+				log.Printf("Stream %d client write timeout", pkt.StreamID)
+				sc.close()
 			}
-			sc.bytesIn.Add(int64(n))
 		}
 
 	case tunnel.StreamClose:
-		// Server closed the stream, notify handleConnection
-		select {
-		case <-sc.closedCh:
-			// Already closed
-		default:
-			close(sc.closedCh)
-		}
-		// Close TCP connection
-		sc.conn.Close()
+		// Server closed the stream, signal writer to drain and finish
+		// Don't close TCP connection yet - let writer drain first
+		sc.serverClosed.Store(true)
+		sc.signalClose()
 	}
 }
 
@@ -263,7 +346,7 @@ func (c *Client) Close() error {
 	// Close all streams
 	c.streams.Range(func(key, value interface{}) bool {
 		sc := value.(*streamConn)
-		sc.conn.Close()
+		sc.close()
 		return true
 	})
 

@@ -8,6 +8,7 @@
 # Ignore binary in root but allow cmd/shadow-gre directory
 /shadow-gre
 !/cmd/shadow-gre/
+/test-logs
 
 # Test binary
 *.test

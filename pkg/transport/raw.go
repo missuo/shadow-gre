@@ -7,9 +7,16 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/missuo/shadow-gre/pkg/gre"
 )
+
+// setSocketBuffer sets the socket receive and send buffer sizes
+func setSocketBuffer(fd uintptr, size int) {
+	syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, size)
+	syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
+}
 
 // RawTransport handles raw socket communication for GRE packets
 type RawTransport struct {
@@ -32,6 +39,14 @@ func NewRawTransport(localIP, remoteIP net.IP, key uint32) (*RawTransport, error
 	conn, err := net.ListenIP("ip4:gre", &net.IPAddr{IP: localIP})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create raw socket: %w (hint: run with sudo/root)", err)
+	}
+
+	// Increase socket buffer sizes for high throughput
+	if rawConn, err := conn.SyscallConn(); err == nil {
+		rawConn.Control(func(fd uintptr) {
+			// Set receive buffer to 4MB
+			setSocketBuffer(fd, 4*1024*1024)
+		})
 	}
 
 	return &RawTransport{

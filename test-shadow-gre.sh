@@ -299,20 +299,90 @@ echo ""
 # 步骤 7: 并发测试
 echo -e "${YELLOW}[7/7] 并发连接测试...${NC}"
 
+# 并发测试函数 - 正确检测所有请求的成功/失败
+run_concurrent_test() {
+    local count=$1
+    local timeout=$2
+    local pids=()
+    local failed=0
+
+    for i in $(seq 1 $count); do
+        curl -s --max-time $timeout "http://127.0.0.1:$CLIENT_PORT/test" > "$LOG_DIR/curl_$i.out" 2>&1 &
+        pids+=($!)
+    done
+
+    # 等待所有请求完成并检查每个的退出状态
+    for pid in "${pids[@]}"; do
+        if ! wait $pid; then
+            ((failed++))
+        fi
+    done
+
+    # 验证响应内容
+    for i in $(seq 1 $count); do
+        if ! grep -q "Hello from backend!" "$LOG_DIR/curl_$i.out" 2>/dev/null; then
+            ((failed++))
+        fi
+        rm -f "$LOG_DIR/curl_$i.out"
+    done
+
+    return $failed
+}
+
 echo -e "  ${BLUE}→${NC} 测试并发 4 个请求..."
 CONCURRENT_START=$(date +%s%N)
 
-# 并发请求
-for i in {1..4}; do
-    curl -s --max-time 10 "http://127.0.0.1:$CLIENT_PORT/test" > /dev/null &
-done
-
-# 等待所有请求完成
-wait
+if ! run_concurrent_test 4 10; then
+    echo -e "    ${RED}✗ 4 个并发请求部分失败${NC}"
+    echo -e "${YELLOW}=== Client Log (last 50 lines) ===${NC}"
+    tail -50 "$LOG_DIR/client.log"
+    echo ""
+    echo -e "${YELLOW}=== Server Log (last 50 lines) ===${NC}"
+    tail -50 "$LOG_DIR/server.log"
+    error_exit "4 并发测试失败"
+fi
 
 CONCURRENT_END=$(date +%s%N)
 CONCURRENT_TIME=$(( ($CONCURRENT_END - $CONCURRENT_START) / 1000000 ))
 echo -e "    ${GREEN}✓ 4 个并发请求完成，总耗时: ${CONCURRENT_TIME}ms${NC}"
+
+# 测试 10 并发
+echo -e "  ${BLUE}→${NC} 测试并发 10 个请求..."
+CONCURRENT10_START=$(date +%s%N)
+
+if ! run_concurrent_test 10 15; then
+    echo -e "    ${RED}✗ 10 个并发请求部分失败${NC}"
+    echo -e "${YELLOW}查看日志:${NC}"
+    echo -e "${YELLOW}=== Client Log (last 100 lines) ===${NC}"
+    tail -100 "$LOG_DIR/client.log"
+    echo ""
+    echo -e "${YELLOW}=== Server Log (last 100 lines) ===${NC}"
+    tail -100 "$LOG_DIR/server.log"
+    error_exit "10 并发测试失败"
+fi
+
+CONCURRENT10_END=$(date +%s%N)
+CONCURRENT10_TIME=$(( ($CONCURRENT10_END - $CONCURRENT10_START) / 1000000 ))
+echo -e "    ${GREEN}✓ 10 个并发请求完成，总耗时: ${CONCURRENT10_TIME}ms${NC}"
+
+# 测试 20 并发
+echo -e "  ${BLUE}→${NC} 测试并发 20 个请求..."
+CONCURRENT20_START=$(date +%s%N)
+
+if ! run_concurrent_test 20 20; then
+    echo -e "    ${RED}✗ 20 个并发请求部分失败${NC}"
+    echo -e "${YELLOW}查看日志:${NC}"
+    echo -e "${YELLOW}=== Client Log (last 100 lines) ===${NC}"
+    tail -100 "$LOG_DIR/client.log"
+    echo ""
+    echo -e "${YELLOW}=== Server Log (last 100 lines) ===${NC}"
+    tail -100 "$LOG_DIR/server.log"
+    error_exit "20 并发测试失败"
+fi
+
+CONCURRENT20_END=$(date +%s%N)
+CONCURRENT20_TIME=$(( ($CONCURRENT20_END - $CONCURRENT20_START) / 1000000 ))
+echo -e "    ${GREEN}✓ 20 个并发请求完成，总耗时: ${CONCURRENT20_TIME}ms${NC}"
 
 echo -e "${GREEN}✓ 并发测试完成${NC}"
 echo ""
@@ -342,6 +412,8 @@ echo -e "  • 基本连接: ${GREEN}通过${NC}"
 echo -e "  • 小包传输: ${GREEN}通过${NC} (平均 $((SMALL_TIME/10))ms/req)"
 echo -e "  • 大包传输: ${GREEN}通过${NC} (${THROUGHPUT} KB/s)"
 echo -e "  • 并发连接: ${GREEN}通过${NC} (4 个并发，${CONCURRENT_TIME}ms)"
+echo -e "  • 高并发:   ${GREEN}通过${NC} (10 个并发，${CONCURRENT10_TIME}ms)"
+echo -e "  • 更高并发: ${GREEN}通过${NC} (20 个并发，${CONCURRENT20_TIME}ms)"
 echo ""
 echo -e "${YELLOW}日志文件位置:${NC}"
 echo -e "  • Client:  $LOG_DIR/client.log"
