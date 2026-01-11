@@ -151,7 +151,8 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 		writerDone: make(chan struct{}),
 	}
 	c.streams.Store(streamID, sc)
-	defer c.streams.Delete(streamID)
+	// Don't use defer for deletion - we need to keep the stream longer for late packets
+	// defer c.streams.Delete(streamID)
 
 	log.Printf("New connection from %s, stream ID: %d", tcpConn.RemoteAddr(), streamID)
 
@@ -227,6 +228,13 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 
 	log.Printf("Connection closed, stream ID: %d (sent: %d bytes, recv: %d bytes)",
 		streamID, sc.bytesOut.Load(), sc.bytesIn.Load())
+
+	// Keep the stream in the map for a while to handle late-arriving packets
+	// This prevents "stream not found" errors for packets that arrive after we close
+	go func() {
+		time.Sleep(5 * time.Second)
+		c.streams.Delete(streamID)
+	}()
 }
 
 // writeLoop writes data from writeCh to TCP connection
@@ -252,8 +260,9 @@ func (sc *streamConn) writeLoop() {
 			sc.bytesIn.Add(int64(n))
 		case <-sc.closeCh:
 			// Close signal received
-			// Wait briefly for any in-flight GRE packets to be queued
-			time.Sleep(10 * time.Millisecond)
+			// Wait for any in-flight GRE packets to be queued
+			// Network reordering can cause StreamClose to arrive before data
+			time.Sleep(500 * time.Millisecond)
 			// Now block new data and drain
 			sc.closed.Store(true)
 			sc.drainWriteCh()
@@ -304,15 +313,13 @@ func (c *Client) handleGREPacket(data []byte) {
 	// Parse stream packet
 	pkt, err := tunnel.UnmarshalStream(data)
 	if err != nil {
-		log.Printf("Failed to unmarshal stream packet: %v", err)
 		return
 	}
 
 	// Look up stream
 	scI, ok := c.streams.Load(pkt.StreamID)
 	if !ok {
-		// Stream not found, ignore
-		log.Printf("Stream %d not found, ignoring packet (flags=%d, data=%d bytes)", pkt.StreamID, pkt.Flags, len(pkt.Data))
+		// Stream not found, ignore (normal for late-arriving packets after close)
 		return
 	}
 	sc := scI.(*streamConn)
