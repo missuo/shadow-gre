@@ -242,8 +242,7 @@ func (sc *streamConn) writeLoop() {
 			// Set write deadline to prevent blocking forever
 			sc.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := sc.conn.Write(data); err != nil {
-				// Write error, drain channel and exit
-				log.Printf("Stream %d: TCP write error: %v", sc.id, err)
+				// Write error (e.g., broken pipe), drain channel and exit
 				sc.closed.Store(true)
 				sc.drainWriteCh()
 				return
@@ -252,10 +251,9 @@ func (sc *streamConn) writeLoop() {
 		case <-sc.closeCh:
 			// Close signal received
 			// Wait briefly for any in-flight GRE packets to be queued
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			// Now block new data and drain
 			sc.closed.Store(true)
-			log.Printf("Stream %d: writeLoop received close signal, draining", sc.id)
 			sc.drainWriteCh()
 			return
 		}
@@ -324,12 +322,9 @@ func (c *Client) handleGREPacket(data []byte) {
 		}
 		// Check if stream is already closed
 		if sc.closed.Load() {
-			log.Printf("Stream %d: received data but stream is closed, dropping %d bytes", pkt.StreamID, len(pkt.Data))
 			return
 		}
 		// pkt.Data is already copied by UnmarshalStream
-		// Use simple select with timeout - don't check closeCh here
-		// to avoid Go's random selection causing data loss
 		select {
 		case sc.writeCh <- pkt.Data:
 			// Queued successfully
@@ -341,9 +336,8 @@ func (c *Client) handleGREPacket(data []byte) {
 
 	case tunnel.StreamClose:
 		// Server closed the stream
-		log.Printf("Stream %d: received StreamClose from server", pkt.StreamID)
 		sc.serverClosed.Store(true)
-		// Signal writer to drain - it will wait 50ms for in-flight packets before setting closed
+		// Signal writer to drain - it will wait for in-flight packets before setting closed
 		sc.signalClose()
 	}
 }
