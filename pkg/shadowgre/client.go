@@ -239,6 +239,8 @@ func (sc *streamConn) writeLoop() {
 			if !ok {
 				return
 			}
+			// Set write deadline to prevent blocking forever
+			sc.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := sc.conn.Write(data); err != nil {
 				// Write error, drain channel and exit
 				sc.drainWriteCh()
@@ -261,6 +263,8 @@ func (sc *streamConn) drainWriteCh() {
 			if !ok {
 				return
 			}
+			// Set write deadline for drain as well
+			sc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if _, err := sc.conn.Write(data); err != nil {
 				return
 			}
@@ -306,23 +310,24 @@ func (c *Client) handleGREPacket(data []byte) {
 	// Handle based on flags
 	switch pkt.Flags {
 	case tunnel.StreamData:
-		// Queue data to write channel (non-blocking with timeout)
-		if len(pkt.Data) > 0 && !sc.closed.Load() {
-			// pkt.Data is already copied by UnmarshalStream
-			select {
-			case sc.writeCh <- pkt.Data:
-				// Queued successfully
-			case <-sc.closeCh:
-				// Stream closing, but still try to queue
-				select {
-				case sc.writeCh <- pkt.Data:
-				default:
-				}
-			case <-time.After(5 * time.Second):
-				// Timeout - TCP write is too slow
-				log.Printf("Stream %d client write timeout", pkt.StreamID)
-				sc.close()
-			}
+		// Queue data to write channel
+		if len(pkt.Data) == 0 {
+			return
+		}
+		// Check if stream is already closed
+		if sc.closed.Load() {
+			return
+		}
+		// pkt.Data is already copied by UnmarshalStream
+		// Use simple select with timeout - don't check closeCh here
+		// to avoid Go's random selection causing data loss
+		select {
+		case sc.writeCh <- pkt.Data:
+			// Queued successfully
+		case <-time.After(5 * time.Second):
+			// Timeout - TCP write is too slow
+			log.Printf("Stream %d client write timeout", pkt.StreamID)
+			sc.close()
 		}
 
 	case tunnel.StreamClose:
