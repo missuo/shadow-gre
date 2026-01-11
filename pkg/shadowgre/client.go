@@ -241,13 +241,15 @@ func (sc *streamConn) writeLoop() {
 			}
 			// Set write deadline to prevent blocking forever
 			sc.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			if _, err := sc.conn.Write(data); err != nil {
+			n, err := sc.conn.Write(data)
+			if err != nil {
 				// Write error (e.g., broken pipe), drain channel and exit
+				log.Printf("Stream %d: TCP write error after %d bytes: %v", sc.id, n, err)
 				sc.closed.Store(true)
 				sc.drainWriteCh()
 				return
 			}
-			sc.bytesIn.Add(int64(len(data)))
+			sc.bytesIn.Add(int64(n))
 		case <-sc.closeCh:
 			// Close signal received
 			// Wait briefly for any in-flight GRE packets to be queued
@@ -302,6 +304,7 @@ func (c *Client) handleGREPacket(data []byte) {
 	// Parse stream packet
 	pkt, err := tunnel.UnmarshalStream(data)
 	if err != nil {
+		log.Printf("Failed to unmarshal stream packet: %v", err)
 		return
 	}
 
@@ -309,6 +312,7 @@ func (c *Client) handleGREPacket(data []byte) {
 	scI, ok := c.streams.Load(pkt.StreamID)
 	if !ok {
 		// Stream not found, ignore
+		log.Printf("Stream %d not found, ignoring packet (flags=%d, data=%d bytes)", pkt.StreamID, pkt.Flags, len(pkt.Data))
 		return
 	}
 	sc := scI.(*streamConn)
