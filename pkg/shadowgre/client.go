@@ -16,27 +16,29 @@ import (
 
 const (
 	copyBufferSize = 64 * 1024 // 64KB buffer for io.Copy
-	// maxReadSize must fit in MTU: 1500 - IP(20) - GRE(8) - StreamHeader(5) = 1467
-	// Use 1400 for safety margin
-	maxReadSize = 1400
+	// maxReadSize must fit in MTU: 1500 - IP(20) - GRE(8) - ReliableHeader(13+SACK) = ~1450
+	// Use 1300 for safety margin with reliable headers and SACK blocks
+	maxReadSize = 1300
 	// GRE header size with Key flag: 4(base) + 4(key) = 8
 	greHeaderSize = 8
-	// greBufferSize needs to fit: GRE(8) + StreamHeader(5) + Data(1400) = 1413
+	// greBufferSize needs to fit: GRE(8) + ReliableHeader(~45) + Data(1300) = ~1353
 	// Round up for alignment
-	greBufferSize = 1420
+	greBufferSize = 1400
+	// Maximum reliable header size: 9 + 4(ACK) + 1 + 4*8(SACK) = 46
+	maxReliableHeaderSize = 46
 )
 
 // streamConn represents an active TCP connection
 type streamConn struct {
-	id            uint32
-	conn          net.Conn
-	writeCh       chan []byte   // Async write channel
-	closeCh       chan struct{} // Signal to stop accepting new data
-	writerDone    chan struct{} // Signal that writer has finished
-	serverClosed  atomic.Bool   // Server sent StreamClose
-	closed        atomic.Bool
-	bytesIn       atomic.Int64
-	bytesOut      atomic.Int64
+	id           uint32
+	conn         net.Conn
+	writeCh      chan []byte    // Async write channel (from GRE to TCP)
+	closeCh      chan struct{}  // Signal to stop accepting new data
+	writerDone   chan struct{}  // Signal that writer has finished
+	serverClosed atomic.Bool    // Server sent StreamClose
+	closed       atomic.Bool
+	bytesIn      atomic.Int64
+	bytesOut     atomic.Int64
 }
 
 // Client represents a shadow-gre client
@@ -53,6 +55,9 @@ type Client struct {
 	// Stream management
 	nextStreamID atomic.Uint32
 	streams      sync.Map // map[uint32]*streamConn
+
+	// Reliable transport layer
+	reliable *tunnel.ReliableManager
 
 	// Buffer pool for zero-copy
 	bufferPool sync.Pool
@@ -90,6 +95,15 @@ func (c *Client) Start() error {
 	}
 	c.transport = trans
 
+	// Create reliable manager
+	c.reliable = tunnel.NewReliableManager(
+		func(data []byte) error {
+			return c.transport.Send(data)
+		},
+		c.handleReliableData,
+		c.handleReliableClose,
+	)
+
 	// Set receive handler to process incoming GRE packets
 	c.transport.SetReceiveHandler(c.handleGREPacket)
 
@@ -104,7 +118,7 @@ func (c *Client) Start() error {
 	}
 	c.listener = listener
 
-	log.Printf("Client listening on %s, forwarding via GRE to %s", c.listenAddr, c.serverIP)
+	log.Printf("Client listening on %s, forwarding via GRE to %s (reliable mode)", c.listenAddr, c.serverIP)
 
 	c.wg.Add(1)
 	go c.acceptLoop()
@@ -151,27 +165,20 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 		writerDone: make(chan struct{}),
 	}
 	c.streams.Store(streamID, sc)
-	// Don't use defer for deletion - we need to keep the stream longer for late packets
-	// defer c.streams.Delete(streamID)
 
 	log.Printf("New connection from %s, stream ID: %d", tcpConn.RemoteAddr(), streamID)
 
 	// Start writer goroutine (GRE → TCP)
 	go sc.writeLoop()
 
-	// TCP → GRE (read from TCP, send to GRE)
-	bufPtr := c.bufferPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer c.bufferPool.Put(bufPtr)
+	// TCP → GRE (read from TCP, send to GRE via reliable layer)
+	buf := make([]byte, maxReadSize)
 
 	for {
 		// Set read deadline to allow checking for server close
 		tcpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 
-		// Reserve space for GRE header at the beginning, then Stream header
-		// Layout: [GRE header (8)][Stream header (5)][TCP data (up to 1400)]
-		dataOffset := greHeaderSize + tunnel.StreamHeaderSize
-		n, err := tcpConn.Read(buf[dataOffset : dataOffset+maxReadSize])
+		n, err := tcpConn.Read(buf)
 		if err != nil {
 			// Check if server closed the stream
 			if sc.serverClosed.Load() {
@@ -189,26 +196,21 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 
 		sc.bytesOut.Add(int64(n))
 
-		// Build stream packet directly in buffer starting after GRE header (zero-copy)
-		pkt := tunnel.StreamPacket{
-			StreamID: streamID,
-			Flags:    tunnel.StreamData,
-			Data:     buf[dataOffset : dataOffset+n],
-		}
-		streamSize := pkt.MarshalTo(buf[greHeaderSize:])
+		// Send via reliable layer
+		// Make a copy since reliable layer stores for retransmission
+		data := make([]byte, n)
+		copy(data, buf[:n])
 
-		// Send via GRE (will add GRE header to the reserved space)
-		if err := c.transport.SendZeroCopy(buf, greHeaderSize, streamSize); err != nil {
-			log.Printf("Stream %d send error: %v", streamID, err)
+		if err := c.reliable.Send(streamID, data); err != nil {
+			log.Printf("Stream %d reliable send error: %v", streamID, err)
 			break
 		}
 	}
 
 	// Send close packet to notify server (half-close)
 	if !sc.serverClosed.Load() {
-		closePkt := tunnel.NewClosePacket(streamID)
-		if closeData := closePkt.Marshal(); len(closeData) > 0 {
-			c.transport.Send(closeData)
+		if err := c.reliable.SendClose(streamID); err != nil {
+			log.Printf("Stream %d send close error: %v", streamID, err)
 		}
 	}
 
@@ -234,6 +236,7 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	go func() {
 		time.Sleep(5 * time.Second)
 		c.streams.Delete(streamID)
+		c.reliable.RemoveStream(streamID)
 	}()
 }
 
@@ -308,49 +311,54 @@ func (sc *streamConn) close() {
 	sc.conn.Close()
 }
 
-// handleGREPacket processes incoming GRE packets
+// handleGREPacket processes incoming GRE packets (reliable layer)
 func (c *Client) handleGREPacket(data []byte) {
-	// Parse stream packet
-	pkt, err := tunnel.UnmarshalStream(data)
-	if err != nil {
+	// Pass to reliable manager for processing
+	if err := c.reliable.Receive(data); err != nil {
+		// Ignore parse errors silently
 		return
 	}
+}
 
+// handleReliableData handles data delivered by reliable layer
+func (c *Client) handleReliableData(streamID uint32, data []byte) {
 	// Look up stream
-	scI, ok := c.streams.Load(pkt.StreamID)
+	scI, ok := c.streams.Load(streamID)
 	if !ok {
 		// Stream not found, ignore (normal for late-arriving packets after close)
 		return
 	}
 	sc := scI.(*streamConn)
 
-	// Handle based on flags
-	switch pkt.Flags {
-	case tunnel.StreamData:
-		// Queue data to write channel
-		if len(pkt.Data) == 0 {
-			return
-		}
-		// Check if stream is already closed
-		if sc.closed.Load() {
-			return
-		}
-		// pkt.Data is already copied by UnmarshalStream
-		select {
-		case sc.writeCh <- pkt.Data:
-			// Queued successfully
-		case <-time.After(5 * time.Second):
-			// Timeout - TCP write is too slow
-			log.Printf("Stream %d client write timeout", pkt.StreamID)
-			sc.close()
-		}
-
-	case tunnel.StreamClose:
-		// Server closed the stream
-		sc.serverClosed.Store(true)
-		// Signal writer to drain - it will wait for in-flight packets before setting closed
-		sc.signalClose()
+	// Check if stream is already closed
+	if sc.closed.Load() {
+		return
 	}
+
+	// Queue data to write channel
+	select {
+	case sc.writeCh <- data:
+		// Queued successfully
+	case <-time.After(5 * time.Second):
+		// Timeout - TCP write is too slow
+		log.Printf("Stream %d client write timeout", streamID)
+		sc.close()
+	}
+}
+
+// handleReliableClose handles close notification from reliable layer
+func (c *Client) handleReliableClose(streamID uint32) {
+	// Look up stream
+	scI, ok := c.streams.Load(streamID)
+	if !ok {
+		return
+	}
+	sc := scI.(*streamConn)
+
+	// Server closed the stream
+	sc.serverClosed.Store(true)
+	// Signal writer to drain - it will wait for in-flight packets before setting closed
+	sc.signalClose()
 }
 
 // Close closes the client
@@ -361,6 +369,11 @@ func (c *Client) Close() error {
 
 	if c.listener != nil {
 		c.listener.Close()
+	}
+
+	// Close reliable manager
+	if c.reliable != nil {
+		c.reliable.Close()
 	}
 
 	// Close all streams

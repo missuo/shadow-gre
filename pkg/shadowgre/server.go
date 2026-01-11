@@ -19,6 +19,7 @@ type clientState struct {
 	clientIP net.IP
 	streams  sync.Map // map[uint32]*serverStream
 	server   *Server
+	reliable *tunnel.ReliableManager
 }
 
 // streamState represents the connection state
@@ -95,53 +96,68 @@ func (s *Server) Start() error {
 	// Start transport
 	s.transport.Start()
 
-	log.Printf("Server listening on %s (GRE protocol), forwarding to %s", s.localIP, s.backendAddr)
+	log.Printf("Server listening on %s (GRE protocol, reliable mode), forwarding to %s", s.localIP, s.backendAddr)
 
 	return nil
 }
 
-// handleGREPacket processes incoming GRE packets
-func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
-	// Parse stream packet
-	pkt, err := tunnel.UnmarshalStreamNoCopy(data)
-	if err != nil {
-		log.Printf("Failed to unmarshal stream packet from %s: %v (data length: %d)", clientIP, err, len(data))
-		return
+// getOrCreateClient gets or creates client state for a client IP
+func (s *Server) getOrCreateClient(clientIP net.IP) *clientState {
+	clientKey := clientIP.String()
+	csI, loaded := s.clients.Load(clientKey)
+	if loaded {
+		return csI.(*clientState)
 	}
 
-	// Get or create client state
-	clientKey := clientIP.String()
-	csI, _ := s.clients.LoadOrStore(clientKey, &clientState{
+	// Create new client state with reliable manager
+	cs := &clientState{
 		clientIP: clientIP,
 		server:   s,
-	})
-	cs := csI.(*clientState)
+	}
 
-	// Handle based on flags
-	switch pkt.Flags {
-	case tunnel.StreamData:
-		s.handleStreamData(cs, clientIP, pkt)
+	// Create reliable manager for this client
+	cs.reliable = tunnel.NewReliableManager(
+		func(data []byte) error {
+			return s.transport.Send(clientIP, data)
+		},
+		func(streamID uint32, data []byte) {
+			s.handleReliableData(cs, streamID, data)
+		},
+		func(streamID uint32) {
+			s.handleReliableClose(cs, streamID)
+		},
+	)
 
-	case tunnel.StreamClose:
-		s.handleStreamClose(cs, pkt.StreamID)
+	actual, loaded := s.clients.LoadOrStore(clientKey, cs)
+	if loaded {
+		// Another goroutine created it, close ours
+		cs.reliable.Close()
+		return actual.(*clientState)
+	}
+
+	return cs
+}
+
+// handleGREPacket processes incoming GRE packets
+func (s *Server) handleGREPacket(clientIP net.IP, data []byte) {
+	// Get or create client state
+	cs := s.getOrCreateClient(clientIP)
+
+	// Pass to reliable manager for processing
+	if err := cs.reliable.Receive(data); err != nil {
+		// Ignore parse errors silently
+		return
 	}
 }
 
-// handleStreamData handles incoming data packets
-func (s *Server) handleStreamData(cs *clientState, clientIP net.IP, pkt *tunnel.StreamPacket) {
-	// Copy data immediately (pkt.Data references the receive buffer which will be reused)
-	var dataCopy []byte
-	if len(pkt.Data) > 0 {
-		dataCopy = make([]byte, len(pkt.Data))
-		copy(dataCopy, pkt.Data)
-	}
-
+// handleReliableData handles data delivered by reliable layer
+func (s *Server) handleReliableData(cs *clientState, streamID uint32, data []byte) {
 	// Get or create stream
-	ssI, loaded := cs.streams.Load(pkt.StreamID)
+	ssI, loaded := cs.streams.Load(streamID)
 	if !loaded {
 		// Create new stream (async dial)
-		ss := s.createStream(pkt.StreamID, clientIP, cs)
-		actual, alreadyExists := cs.streams.LoadOrStore(pkt.StreamID, ss)
+		ss := s.createStream(streamID, cs.clientIP, cs)
+		actual, alreadyExists := cs.streams.LoadOrStore(streamID, ss)
 		if alreadyExists {
 			// Another goroutine created it first, use that one
 			ss = actual.(*serverStream)
@@ -157,7 +173,7 @@ func (s *Server) handleStreamData(cs *clientState, clientIP net.IP, pkt *tunnel.
 		return
 	}
 
-	if len(dataCopy) == 0 {
+	if len(data) == 0 {
 		return
 	}
 
@@ -166,6 +182,9 @@ func (s *Server) handleStreamData(cs *clientState, clientIP net.IP, pkt *tunnel.
 		ss.pendingMu.Lock()
 		// Double-check state after acquiring lock
 		if streamState(ss.state.Load()) == streamStateConnecting {
+			// Make a copy of data
+			dataCopy := make([]byte, len(data))
+			copy(dataCopy, data)
 			ss.pendingData = append(ss.pendingData, dataCopy)
 			ss.pendingMu.Unlock()
 			return
@@ -183,20 +202,22 @@ func (s *Server) handleStreamData(cs *clientState, clientIP net.IP, pkt *tunnel.
 	}
 
 	// Stream is connected, send via channel
-	// Use simple select with timeout - don't check closeCh here
-	// to avoid Go's random selection causing data loss
+	// Make a copy of data
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+
 	select {
 	case ss.writeCh <- dataCopy:
 		// Queued successfully
 	case <-time.After(5 * time.Second):
 		// Timeout - backend is too slow
-		log.Printf("Stream %d write timeout (backend too slow), closing stream", pkt.StreamID)
+		log.Printf("Stream %d write timeout (backend too slow), closing stream", streamID)
 		ss.close()
 	}
 }
 
-// handleStreamClose handles stream close packets
-func (s *Server) handleStreamClose(cs *clientState, streamID uint32) {
+// handleReliableClose handles close notification from reliable layer
+func (s *Server) handleReliableClose(cs *clientState, streamID uint32) {
 	ssI, ok := cs.streams.Load(streamID)
 	if !ok {
 		return
@@ -239,11 +260,8 @@ func (ss *serverStream) connectAndRun() {
 		log.Printf("Stream %d failed to connect to backend: %v", ss.id, err)
 		ss.state.Store(int32(streamStateClosed))
 		ss.cs.streams.Delete(ss.id)
-		// Send close to client
-		closePkt := tunnel.NewClosePacket(ss.id)
-		if closeData := closePkt.Marshal(); len(closeData) > 0 {
-			ss.server.transport.Send(ss.clientIP, closeData)
-		}
+		// Send close to client via reliable layer
+		ss.cs.reliable.SendClose(ss.id)
 		return
 	}
 
@@ -282,6 +300,7 @@ func (ss *serverStream) connectAndRun() {
 
 	// Cleanup
 	ss.cs.streams.Delete(ss.id)
+	ss.cs.reliable.RemoveStream(ss.id)
 	log.Printf("Stream %d from %s closed (sent: %d bytes, recv: %d bytes)",
 		ss.id, ss.clientIP, ss.bytesIn.Load(), ss.bytesOut.Load())
 }
@@ -342,12 +361,9 @@ func (ss *serverStream) drainAndShutdownWrite() {
 	}
 }
 
-// readFromBackend reads data from backend and sends to client via GRE
+// readFromBackend reads data from backend and sends to client via reliable GRE
 func (ss *serverStream) readFromBackend() {
-	bufPtr := ss.server.bufferPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer ss.server.bufferPool.Put(bufPtr)
-
+	buf := make([]byte, maxReadSize)
 	idleTimeout := 30 * time.Second // Timeout after client closes
 
 	for {
@@ -356,10 +372,7 @@ func (ss *serverStream) readFromBackend() {
 			ss.backendConn.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
 
-		// Reserve space for GRE header at the beginning, then Stream header
-		// Layout: [GRE header (8)][Stream header (5)][Backend data (up to 1400)]
-		dataOffset := greHeaderSize + tunnel.StreamHeaderSize
-		n, err := ss.backendConn.Read(buf[dataOffset : dataOffset+maxReadSize])
+		n, err := ss.backendConn.Read(buf)
 		if err != nil {
 			// Don't log EOF, timeout, or closed connection errors (normal closure)
 			if err != io.EOF && !isClosedConnError(err) && !isTimeoutError(err) {
@@ -373,26 +386,19 @@ func (ss *serverStream) readFromBackend() {
 
 		ss.bytesIn.Add(int64(n))
 
-		// Build stream packet directly in buffer starting after GRE header (zero-copy)
-		pkt := tunnel.StreamPacket{
-			StreamID: ss.id,
-			Flags:    tunnel.StreamData,
-			Data:     buf[dataOffset : dataOffset+n],
-		}
-		streamSize := pkt.MarshalTo(buf[greHeaderSize:])
+		// Send via reliable layer
+		// Make a copy since reliable layer stores for retransmission
+		data := make([]byte, n)
+		copy(data, buf[:n])
 
-		// Send via GRE (will add GRE header to the reserved space)
-		if err := ss.server.transport.SendZeroCopy(ss.clientIP, buf, greHeaderSize, streamSize); err != nil {
-			log.Printf("Stream %d send error: %v", ss.id, err)
+		if err := ss.cs.reliable.Send(ss.id, data); err != nil {
+			log.Printf("Stream %d reliable send error: %v", ss.id, err)
 			break
 		}
 	}
 
-	// Send close packet to client
-	closePkt := tunnel.NewClosePacket(ss.id)
-	if closeData := closePkt.Marshal(); len(closeData) > 0 {
-		ss.server.transport.Send(ss.clientIP, closeData)
-	}
+	// Send close packet to client via reliable layer
+	ss.cs.reliable.SendClose(ss.id)
 
 	// Close the stream
 	ss.close()
@@ -456,9 +462,14 @@ func (s *Server) Close() error {
 		return nil
 	}
 
-	// Close all client streams
+	// Close all client streams and reliable managers
 	s.clients.Range(func(key, value interface{}) bool {
 		cs := value.(*clientState)
+		// Close reliable manager
+		if cs.reliable != nil {
+			cs.reliable.Close()
+		}
+		// Close all streams
 		cs.streams.Range(func(k, v interface{}) bool {
 			if ss := v.(*serverStream); ss != nil {
 				ss.close()
