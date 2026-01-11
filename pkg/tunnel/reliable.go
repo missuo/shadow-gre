@@ -24,16 +24,16 @@ const (
 	MaxSackBlocks         = 4 // Maximum SACK blocks per packet
 
 	// Protocol parameters
-	DefaultWindowSize   = 256            // Maximum unacked packets
-	DefaultRTOMs        = 150            // Initial retransmission timeout in ms
-	MinRTOMs            = 30             // Minimum RTO
-	MaxRTOMs            = 2000           // Maximum RTO
-	MaxRetries          = 20             // Max retransmission attempts
-	AckDelayMs          = 5              // Delay before sending pure ACK
-	AckEveryN           = 4              // Send ACK every N packets (like TCP delayed ACK)
-	MaxOutOfOrderBuffer = 512            // Max out-of-order packets to buffer
-	CleanupIntervalMs   = 5000           // Stream cleanup interval
-	FastRetransmitCount = 3              // Duplicate ACKs before fast retransmit
+	DefaultWindowSize   = 256  // Maximum unacked packets
+	DefaultRTOMs        = 150  // Initial retransmission timeout in ms
+	MinRTOMs            = 30   // Minimum RTO
+	MaxRTOMs            = 2000 // Maximum RTO
+	MaxRetries          = 20   // Max retransmission attempts
+	AckDelayMs          = 5    // Delay before sending pure ACK
+	AckEveryN           = 4    // Send ACK every N packets (like TCP delayed ACK)
+	MaxOutOfOrderBuffer = 512  // Max out-of-order packets to buffer
+	CleanupIntervalMs   = 5000 // Stream cleanup interval
+	FastRetransmitCount = 3    // Duplicate ACKs before fast retransmit
 
 	// RTT estimation parameters (RFC 6298)
 	RTTAlpha = 0.125 // SRTT smoothing factor
@@ -203,20 +203,20 @@ func UnmarshalReliableNoCopy(data []byte) (*ReliablePacket, error) {
 
 // unackedPacket represents a packet waiting for ACK
 type unackedPacket struct {
-	pkt       *ReliablePacket
-	data      []byte // Marshaled data for retransmission
-	sentTime  time.Time
-	retries   int
-	sacked    bool // Marked by SACK, but not yet fully acked
+	pkt      *ReliablePacket
+	data     []byte // Marshaled data for retransmission
+	sentTime time.Time
+	retries  int
+	sacked   bool // Marked by SACK, but not yet fully acked
 }
 
 // RTTEstimator estimates round-trip time using RFC 6298 algorithm
 type RTTEstimator struct {
-	srtt    float64 // Smoothed RTT
-	rttvar  float64 // RTT variance
-	rto     float64 // Retransmission timeout
-	hasRTT  bool    // Whether we have an RTT sample
-	mu      sync.Mutex
+	srtt   float64 // Smoothed RTT
+	rttvar float64 // RTT variance
+	rto    float64 // Retransmission timeout
+	hasRTT bool    // Whether we have an RTT sample
+	mu     sync.Mutex
 }
 
 // NewRTTEstimator creates a new RTT estimator
@@ -281,21 +281,22 @@ type ReliableStream struct {
 	streamID uint32
 
 	// Sender state
-	sendSeq    atomic.Uint32          // Next sequence to send
-	sendBase   atomic.Uint32          // Oldest unacked sequence
-	sendWindow int                    // Window size
-	unacked    map[uint32]*unackedPacket
-	unackedMu  sync.Mutex
-	dupAckCount int                   // Duplicate ACK counter for fast retransmit
+	sendSeq      atomic.Uint32 // Next sequence to send
+	sendBase     atomic.Uint32 // Oldest unacked sequence
+	sendWindow   int           // Window size
+	unacked      map[uint32]*unackedPacket
+	unackedMu    sync.Mutex
+	dupAckCount  int       // Duplicate ACK counter for fast retransmit
+	lastSackTime time.Time // Last SACK-based retransmit time (for rate limiting)
 
 	// Receiver state
-	recvNext     atomic.Uint32        // Next expected sequence
-	outOfOrder   map[uint32][]byte    // Out-of-order packets
+	recvNext     atomic.Uint32     // Next expected sequence
+	outOfOrder   map[uint32][]byte // Out-of-order packets
 	outOfOrderMu sync.Mutex
 
 	// Callbacks
-	sendFunc    func([]byte) error    // Function to send packets
-	deliverFunc func([]byte)          // Function to deliver data to app
+	sendFunc    func([]byte) error // Function to send packets
+	deliverFunc func([]byte)       // Function to deliver data to app
 
 	// Control
 	closed  atomic.Bool
@@ -305,10 +306,10 @@ type ReliableStream struct {
 	rttEstimator *RTTEstimator
 
 	// ACK coalescing
-	pendingAck   atomic.Bool
-	ackTimer     *time.Timer
-	ackMu        sync.Mutex
-	recvCounter  atomic.Uint32 // Counter for ACK every N packets
+	pendingAck  atomic.Bool
+	ackTimer    *time.Timer
+	ackMu       sync.Mutex
+	recvCounter atomic.Uint32 // Counter for ACK every N packets
 
 	// Stats
 	retransmits atomic.Uint64
@@ -455,28 +456,93 @@ func (rs *ReliableStream) Receive(pkt *ReliablePacket) (isClose bool) {
 // processAck handles acknowledgment with SACK support
 func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 	rs.unackedMu.Lock()
-	defer rs.unackedMu.Unlock()
 
 	oldBase := rs.sendBase.Load()
+	now := time.Now()
 
-	// Check for duplicate ACK (same ACK number, no new data acked)
+	// Check for duplicate ACK (same ACK number)
 	// ACK=N means "I expect seq=N", so duplicate ACK is when ack == oldBase
-	if ack == oldBase && len(sackBlocks) == 0 {
+	if ack == oldBase {
 		rs.dupAckCount++
-		if rs.dupAckCount >= FastRetransmitCount {
-			// Fast retransmit: retransmit the first unacked packet
-			if up, ok := rs.unacked[oldBase]; ok && !up.sacked {
-				rs.retransmits.Add(1)
-				up.retries++
-				up.sentTime = time.Now()
-				rs.sendFunc(up.data)
+
+		// Mark SACKed packets whenever we receive SACK blocks
+		if len(sackBlocks) > 0 {
+			for _, block := range sackBlocks {
+				for seq := block.Left; seqLessOrEqual(seq, block.Right); seq++ {
+					if up, ok := rs.unacked[seq]; ok {
+						up.sacked = true
+					}
+				}
 			}
-			rs.dupAckCount = 0
 		}
+
+		// Determine if we should trigger retransmission
+		// SACK indicates gaps (packet loss), trigger immediate retransmit
+		// Also use classic fast retransmit on 3 duplicate ACKs without SACK
+		shouldRetransmit := false
+		if len(sackBlocks) > 0 {
+			// SACK-based retransmit: rate limit to avoid excessive retransmits
+			// Use a minimum interval based on RTT/2 or 10ms, whichever is larger
+			minInterval := time.Duration(rs.rttEstimator.RTO()/2) * time.Millisecond
+			if minInterval < 10*time.Millisecond {
+				minInterval = 10 * time.Millisecond
+			}
+			if now.Sub(rs.lastSackTime) >= minInterval {
+				shouldRetransmit = true
+				rs.lastSackTime = now
+			}
+		} else if rs.dupAckCount >= FastRetransmitCount {
+			// Classic fast retransmit: 3 duplicate ACKs without SACK
+			shouldRetransmit = true
+			rs.dupAckCount = 0 // Reset only for classic fast retransmit
+		}
+
+		if shouldRetransmit {
+			// Find packets to retransmit (not SACKed, starting from base)
+			var toRetransmit [][]byte
+
+			if len(sackBlocks) > 0 {
+				// SACK-based: retransmit all un-SACKed packets in gaps
+				// Find all gaps indicated by SACK blocks
+				prevRight := ack
+				for _, block := range sackBlocks {
+					// Retransmit packets in the gap before this SACK block
+					for seq := prevRight; seqLess(seq, block.Left); seq++ {
+						if up, ok := rs.unacked[seq]; ok && !up.sacked {
+							rs.retransmits.Add(1)
+							up.retries++
+							up.sentTime = now
+							toRetransmit = append(toRetransmit, up.data)
+						}
+					}
+					prevRight = block.Right + 1
+				}
+			} else {
+				// Classic fast retransmit: just retransmit the first unacked packet
+				if up, ok := rs.unacked[oldBase]; ok && !up.sacked {
+					rs.retransmits.Add(1)
+					up.retries++
+					up.sentTime = now
+					toRetransmit = append(toRetransmit, up.data)
+				}
+			}
+
+			rs.unackedMu.Unlock()
+
+			// Send retransmissions without holding lock
+			// Note: No RTO backoff for SACK/fast retransmit - these are loss-based,
+			// not timeout-based, so they don't indicate congestion
+			for _, data := range toRetransmit {
+				rs.sendFunc(data)
+			}
+			return
+		}
+
+		rs.unackedMu.Unlock()
 		return
 	}
 
-	// New ACK, reset duplicate counter
+	// New ACK (ack advances), reset duplicate counter
 	rs.dupAckCount = 0
 
 	// Remove all packets before ack (cumulative ACK)
@@ -493,11 +559,38 @@ func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 		}
 	}
 
-	// Process SACK blocks
-	for _, block := range sackBlocks {
-		for seq := block.Left; seqLessOrEqual(seq, block.Right); seq++ {
-			if up, ok := rs.unacked[seq]; ok {
-				up.sacked = true
+	// Process SACK blocks and immediately retransmit gaps
+	// Even with a new cumulative ACK, SACK blocks indicate out-of-order data
+	var toRetransmit [][]byte
+	if len(sackBlocks) > 0 {
+		// Mark SACKed packets
+		for _, block := range sackBlocks {
+			for seq := block.Left; seqLessOrEqual(seq, block.Right); seq++ {
+				if up, ok := rs.unacked[seq]; ok {
+					up.sacked = true
+				}
+			}
+		}
+
+		// Rate-limited SACK-based retransmit
+		minInterval := time.Duration(rs.rttEstimator.RTO()/2) * time.Millisecond
+		if minInterval < 10*time.Millisecond {
+			minInterval = 10 * time.Millisecond
+		}
+		if now.Sub(rs.lastSackTime) >= minInterval {
+			rs.lastSackTime = now
+			// Retransmit gaps indicated by SACK
+			prevRight := ack
+			for _, block := range sackBlocks {
+				for seq := prevRight; seqLess(seq, block.Left); seq++ {
+					if up, ok := rs.unacked[seq]; ok && !up.sacked {
+						rs.retransmits.Add(1)
+						up.retries++
+						up.sentTime = now
+						toRetransmit = append(toRetransmit, up.data)
+					}
+				}
+				prevRight = block.Right + 1
 			}
 		}
 	}
@@ -505,6 +598,13 @@ func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 	// Update send base
 	if seqGreater(ack, rs.sendBase.Load()) {
 		rs.sendBase.Store(ack)
+	}
+
+	rs.unackedMu.Unlock()
+
+	// Send retransmissions without holding lock
+	for _, data := range toRetransmit {
+		rs.sendFunc(data)
 	}
 }
 
@@ -781,11 +881,11 @@ func seqGreater(a, b uint32) bool {
 
 // ReliableManager manages multiple reliable streams
 type ReliableManager struct {
-	streams   sync.Map // map[uint32]*ReliableStream
-	sendFunc  func([]byte) error
-	onData    func(streamID uint32, data []byte)
-	onClose   func(streamID uint32)
-	closed    atomic.Bool
+	streams  sync.Map // map[uint32]*ReliableStream
+	sendFunc func([]byte) error
+	onData   func(streamID uint32, data []byte)
+	onClose  func(streamID uint32)
+	closed   atomic.Bool
 }
 
 // NewReliableManager creates a new reliable manager
