@@ -174,15 +174,20 @@ func (s *Server) handleStreamData(cs *clientState, clientIP net.IP, pkt *tunnel.
 		// State changed to connected, fall through to send via channel
 	}
 
+	// Check if client has already closed write side
+	select {
+	case <-ss.writeCloseCh:
+		// Client closed, ignore new data
+		return
+	default:
+	}
+
 	// Stream is connected, send via channel
-	// Use select with timeout to avoid blocking receiveLoop forever
+	// Use simple select with timeout - don't check closeCh here
+	// to avoid Go's random selection causing data loss
 	select {
 	case ss.writeCh <- dataCopy:
 		// Queued successfully
-	case <-ss.writeCloseCh:
-		// Client closed, ignore new data
-	case <-ss.closeCh:
-		// Stream is closing
 	case <-time.After(5 * time.Second):
 		// Timeout - backend is too slow
 		log.Printf("Stream %d write timeout (backend too slow), closing stream", pkt.StreamID)
@@ -289,6 +294,8 @@ func (ss *serverStream) writeToBackend() {
 			if !ok {
 				return
 			}
+			// Set write deadline to prevent blocking forever
+			ss.backendConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := ss.backendConn.Write(data); err != nil {
 				log.Printf("Stream %d backend write error: %v", ss.id, err)
 				ss.close()
@@ -315,6 +322,8 @@ func (ss *serverStream) drainWriteCh() {
 			if !ok {
 				return
 			}
+			// Set write deadline for drain as well
+			ss.backendConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			ss.backendConn.Write(data)
 			ss.bytesOut.Add(int64(len(data)))
 		default:
