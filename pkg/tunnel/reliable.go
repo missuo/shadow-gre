@@ -582,8 +582,11 @@ func (rs *ReliableStream) processData(seq uint32, data []byte) {
 
 		// Send duplicate ACK with SACK immediately
 		rs.sendAckWithSack()
+	} else {
+		// seq < expected: duplicate, send ACK anyway
+		// This is important for recovery when original ACK was lost
+		rs.sendAckNow()
 	}
-	// seq < expected: duplicate, ignore
 }
 
 // deliverOutOfOrder delivers buffered out-of-order packets
@@ -690,9 +693,10 @@ func (rs *ReliableStream) checkRetransmit() {
 	now := time.Now()
 	rto := time.Duration(rs.rttEstimator.RTO()) * time.Millisecond
 
-	rs.unackedMu.Lock()
-	defer rs.unackedMu.Unlock()
+	// Collect packets to retransmit while holding lock
+	var toRetransmit [][]byte
 
+	rs.unackedMu.Lock()
 	for seq, up := range rs.unacked {
 		// Skip SACK'd packets (they'll be cleaned up by cumulative ACK)
 		if up.sacked {
@@ -706,16 +710,23 @@ func (rs *ReliableStream) checkRetransmit() {
 				continue
 			}
 
-			// Retransmit
+			// Mark for retransmit
 			rs.retransmits.Add(1)
 			up.retries++
 			up.sentTime = now
-
-			// Exponential backoff
-			rs.rttEstimator.Backoff()
-
-			rs.sendFunc(up.data)
+			toRetransmit = append(toRetransmit, up.data)
 		}
+	}
+
+	// Backoff RTO if we have retransmissions
+	if len(toRetransmit) > 0 {
+		rs.rttEstimator.Backoff()
+	}
+	rs.unackedMu.Unlock()
+
+	// Send retransmissions without holding lock
+	for _, data := range toRetransmit {
+		rs.sendFunc(data)
 	}
 }
 
