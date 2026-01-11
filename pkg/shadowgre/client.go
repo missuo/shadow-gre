@@ -211,6 +211,13 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 		}
 	}
 
+	// If server already closed, signal writer to drain
+	// Give a small delay to allow any in-flight GRE packets to arrive
+	if sc.serverClosed.Load() {
+		time.Sleep(50 * time.Millisecond)
+		sc.signalClose()
+	}
+
 	// Wait for writer to finish (server close or timeout)
 	select {
 	case <-sc.writerDone:
@@ -334,11 +341,11 @@ func (c *Client) handleGREPacket(data []byte) {
 		}
 
 	case tunnel.StreamClose:
-		// Server closed the stream, signal writer to drain and finish
-		// Don't close TCP connection yet - let writer drain first
+		// Server closed the stream
+		// Only set serverClosed - let handleConnection handle the close sequence
+		// This allows any remaining data packets to be queued before signalClose
 		log.Printf("Stream %d: received StreamClose from server", pkt.StreamID)
 		sc.serverClosed.Store(true)
-		sc.signalClose()
 	}
 }
 
