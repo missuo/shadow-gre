@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/missuo/shadow-gre/pkg/gre"
 )
@@ -33,6 +34,15 @@ func NewServerTransport(localIP net.IP, key uint32) (*ServerTransport, error) {
 	conn, err := net.ListenIP("ip4:gre", &net.IPAddr{IP: localIP})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create raw socket: %w (hint: run with sudo/root)", err)
+	}
+
+	// Increase socket buffer sizes for high throughput
+	if rawConn, err := conn.SyscallConn(); err == nil {
+		rawConn.Control(func(fd uintptr) {
+			// Set receive and send buffer to 4MB
+			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
+			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024)
+		})
 	}
 
 	return &ServerTransport{
