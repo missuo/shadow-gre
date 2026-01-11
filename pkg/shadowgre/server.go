@@ -179,6 +179,8 @@ func (s *Server) handleStreamData(cs *clientState, clientIP net.IP, pkt *tunnel.
 	select {
 	case ss.writeCh <- dataCopy:
 		// Queued successfully
+	case <-ss.writeCloseCh:
+		// Client closed, ignore new data
 	case <-ss.closeCh:
 		// Stream is closing
 	case <-time.After(5 * time.Second):
@@ -337,18 +339,28 @@ func (ss *serverStream) readFromBackend() {
 	buf := *bufPtr
 	defer ss.server.bufferPool.Put(bufPtr)
 
+	idleTimeout := 30 * time.Second // Timeout after client closes
+
 	for {
+		// If client has closed, set read deadline to avoid hanging forever
+		if ss.clientCloseRecv.Load() {
+			ss.backendConn.SetReadDeadline(time.Now().Add(idleTimeout))
+		}
+
 		// Reserve space for GRE header at the beginning, then Stream header
 		// Layout: [GRE header (8)][Stream header (5)][Backend data (up to 1400)]
 		dataOffset := greHeaderSize + tunnel.StreamHeaderSize
 		n, err := ss.backendConn.Read(buf[dataOffset : dataOffset+maxReadSize])
 		if err != nil {
-			// Don't log EOF or closed connection errors (normal closure)
-			if err != io.EOF && !isClosedConnError(err) {
+			// Don't log EOF, timeout, or closed connection errors (normal closure)
+			if err != io.EOF && !isClosedConnError(err) && !isTimeoutError(err) {
 				log.Printf("Stream %d backend read error: %v", ss.id, err)
 			}
 			break
 		}
+
+		// Reset deadline on successful read
+		ss.backendConn.SetReadDeadline(time.Time{})
 
 		ss.bytesIn.Add(int64(n))
 
@@ -383,6 +395,17 @@ func isClosedConnError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "use of closed network connection")
+}
+
+// isTimeoutError checks if error is a timeout
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	return false
 }
 
 // closeWrite signals writer to stop (client sent StreamClose)
