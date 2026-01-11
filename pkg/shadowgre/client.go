@@ -243,12 +243,14 @@ func (sc *streamConn) writeLoop() {
 			sc.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := sc.conn.Write(data); err != nil {
 				// Write error, drain channel and exit
+				log.Printf("Stream %d: TCP write error: %v", sc.id, err)
 				sc.drainWriteCh()
 				return
 			}
 			sc.bytesIn.Add(int64(len(data)))
 		case <-sc.closeCh:
 			// Close signal received, drain remaining data then exit
+			log.Printf("Stream %d: writeLoop received close signal, draining", sc.id)
 			sc.drainWriteCh()
 			return
 		}
@@ -316,6 +318,7 @@ func (c *Client) handleGREPacket(data []byte) {
 		}
 		// Check if stream is already closed
 		if sc.closed.Load() {
+			log.Printf("Stream %d: received data but stream is closed, dropping %d bytes", pkt.StreamID, len(pkt.Data))
 			return
 		}
 		// pkt.Data is already copied by UnmarshalStream
@@ -333,6 +336,7 @@ func (c *Client) handleGREPacket(data []byte) {
 	case tunnel.StreamClose:
 		// Server closed the stream, signal writer to drain and finish
 		// Don't close TCP connection yet - let writer drain first
+		log.Printf("Stream %d: received StreamClose from server", pkt.StreamID)
 		sc.serverClosed.Store(true)
 		sc.signalClose()
 	}
