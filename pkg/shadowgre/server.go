@@ -258,12 +258,7 @@ func (ss *serverStream) connectAndRun() {
 	ss.pendingMu.Unlock()
 
 	// Write pending data
-	for i, data := range pendingData {
-		if i == 0 && len(data) >= 4 {
-			// Log first few bytes to help diagnose data corruption
-			log.Printf("Stream %d first pending data (%d bytes): %02x %02x %02x %02x...",
-				ss.id, len(data), data[0], data[1], data[2], data[3])
-		}
+	for _, data := range pendingData {
 		if _, err := ss.backendConn.Write(data); err != nil {
 			log.Printf("Stream %d backend write error (pending): %v", ss.id, err)
 			ss.close()
