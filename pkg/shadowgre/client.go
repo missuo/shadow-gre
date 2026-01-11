@@ -262,7 +262,7 @@ func (sc *streamConn) writeLoop() {
 			// Close signal received
 			// Wait for any in-flight GRE packets to be queued
 			// Network reordering can cause StreamClose to arrive before data
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			// Now block new data and drain
 			sc.closed.Store(true)
 			sc.drainWriteCh()
