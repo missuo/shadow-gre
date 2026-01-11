@@ -1,6 +1,9 @@
 # Shadow GRE
 
-TCP over GRE tunnel - Encapsulate TCP traffic into GRE protocol (IP Protocol 47) for transmission.
+[![Release](https://img.shields.io/github/v/release/missuo/shadow-gre)](https://github.com/missuo/shadow-gre/releases)
+[![License](https://img.shields.io/github/license/missuo/shadow-gre)](LICENSE)
+
+TCP over GRE tunnel - Encapsulate TCP traffic into GRE protocol (IP Protocol 47) for transmission with reliable delivery.
 
 ## Architecture
 
@@ -20,18 +23,31 @@ TCP over GRE tunnel - Encapsulate TCP traffic into GRE protocol (IP Protocol 47)
 ## Features
 
 - Uses real GRE protocol (IP Protocol 47)
+- **Reliable transport layer** with retransmission and SACK support
+- Adaptive RTO based on RTT measurement (RFC 6298)
 - Supports multiple connection multiplexing
 - Simple authentication via GRE Key field
-- Docker deployment support
 
-## Requirements
+## Installation
 
+### Download Pre-built Binaries
+
+Download the latest release from [GitHub Releases](https://github.com/missuo/shadow-gre/releases).
+
+Available binaries:
+- `shadow-gre-linux-amd64` - Linux x86_64
+- `shadow-gre-linux-arm64` - Linux ARM64
+- `shadow-gre-linux-armv7` - Linux ARMv7
+- `shadow-gre-darwin-amd64` - macOS Intel
+- `shadow-gre-darwin-arm64` - macOS Apple Silicon
+- `shadow-gre-freebsd-amd64` - FreeBSD x86_64
+
+### Build from Source
+
+Requirements:
 - Go 1.21+
 - Linux (macOS theoretically supported but requires root)
 - Root/sudo privileges (required for raw sockets)
-- Network environment that allows GRE protocol
-
-## Build
 
 ```bash
 go build -o shadow-gre ./cmd/shadow-gre
@@ -75,57 +91,32 @@ sudo ./shadow-gre \
 | `-backend` | Backend service address (server mode only) |
 | `-password` | Shared password for generating GRE Key |
 
-## Docker Deployment
-
-### Server Side
-
-```bash
-# Set password
-export PASSWORD=your_secure_password
-
-# Start
-docker-compose -f docker-compose.server.yml up -d
-```
-
-### Client Side
-
-```bash
-# Set server IP and password
-export SERVER_IP=your_server_ip
-export PASSWORD=your_secure_password
-
-# Start
-docker-compose -f docker-compose.client.yml up -d
-```
-
 ## Example with Shadowsocks
 
 ### Server Configuration
 
-1. Create Shadowsocks config file `config.json`:
+1. Run Shadowsocks server on `127.0.0.1:8388`
+2. Start shadow-gre server:
 
-```json
-{
-    "server": "127.0.0.1",
-    "server_port": 8388,
-    "password": "ss_password",
-    "method": "chacha20-ietf-poly1305"
-}
+```bash
+sudo ./shadow-gre -mode server -local 0.0.0.0 -backend 127.0.0.1:8388 -password YOUR_PASSWORD
 ```
-
-2. Start using docker-compose.server.yml
 
 ### Client Configuration
 
-1. Start shadow-gre client listening on port 1080
-2. Configure Shadowsocks client to connect to 127.0.0.1:1080
+1. Start shadow-gre client:
+
+```bash
+sudo ./shadow-gre -mode client -listen 0.0.0.0:1080 -local 0.0.0.0 -remote SERVER_IP -password YOUR_PASSWORD
+```
+
+2. Configure Shadowsocks client to connect to `127.0.0.1:1080`
 
 ## Important Notes
 
 1. **Root Privileges Required**: Raw socket operations require root/sudo privileges
 2. **Firewall**: Ensure firewall allows GRE protocol (IP Protocol 47)
 3. **NAT Issues**: GRE is an IP layer protocol, some NAT devices may not support it
-4. **Docker Permissions**: Requires `NET_RAW` and `NET_ADMIN` capabilities
 
 ## Protocol Specification
 
@@ -141,36 +132,44 @@ Uses standard GRE format (RFC 2784 + RFC 2890):
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                         Key (from password)                   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         Sequence Number                       |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                         Payload...                            |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-### Tunnel Frame Format
+### Reliable Transport Protocol
 
-Custom frame format in GRE payload for connection multiplexing:
+Custom reliable protocol over GRE for guaranteed delivery:
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|     Type      |                 Connection ID                 |
+|                          Stream ID                            |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Conn ID (cont)|                 Sequence Number               |
+|     Flags     |                Sequence Number                |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Seq (cont)    |        Length         |       Payload...      |
+|  Seq (cont)   |              ACK Number (optional)            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| ACK (cont)    |  SACK Count   |         SACK Blocks...        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          Payload...                           |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-Frame Types:
-- `0x00`: DATA - Data frame
-- `0x01`: SYN - Connection establishment
-- `0x02`: SYN-ACK - Connection acknowledgment
-- `0x03`: FIN - Connection close
-- `0x04`: FIN-ACK - Close acknowledgment
-- `0x05`: PING - Heartbeat
-- `0x06`: PONG - Heartbeat response
+**Flags:**
+- `0x01` DATA - Contains payload data
+- `0x02` ACK - Contains acknowledgment
+- `0x04` CLOSE - Stream close
+- `0x08` SYN - Stream synchronization
+- `0x10` SACK - Contains selective ACK blocks
+
+**Reliability Features:**
+- Cumulative ACK with SACK (Selective Acknowledgment)
+- Adaptive RTO calculation (RFC 6298)
+- Fast retransmit on 3 duplicate ACKs
+- Sliding window flow control (128 packets)
+- Out-of-order packet buffering
+- Sequence number wraparound handling
 
 ## License
 
