@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,7 +36,8 @@ type serverStream struct {
 	clientIP        net.IP
 	backendConn     net.Conn
 	writeCh         chan []byte   // Buffered write channel
-	closeCh         chan struct{} // Signal to stop writer
+	writeCloseCh    chan struct{} // Signal to stop writer (client closed)
+	closeCh         chan struct{} // Signal stream fully closed
 	state           atomic.Int32  // streamState
 	clientCloseRecv atomic.Bool   // Received StreamClose from client
 	bytesIn         atomic.Int64
@@ -194,18 +196,21 @@ func (s *Server) handleStreamClose(cs *clientState, streamID uint32) {
 	}
 	ss := ssI.(*serverStream)
 	ss.clientCloseRecv.Store(true)
-	ss.close()
+	// Only close write channel, let readFromBackend continue
+	// This allows backend to finish sending response
+	ss.closeWrite()
 }
 
 // createStream creates a new stream and starts async backend connection
 func (s *Server) createStream(streamID uint32, clientIP net.IP, cs *clientState) *serverStream {
 	ss := &serverStream{
-		id:       streamID,
-		clientIP: clientIP,
-		writeCh:  make(chan []byte, 4096), // Larger buffer for better throughput
-		closeCh:  make(chan struct{}),
-		server:   s,
-		cs:       cs,
+		id:           streamID,
+		clientIP:     clientIP,
+		writeCh:      make(chan []byte, 4096), // Larger buffer for better throughput
+		writeCloseCh: make(chan struct{}),
+		closeCh:      make(chan struct{}),
+		server:       s,
+		cs:           cs,
 	}
 	ss.state.Store(int32(streamStateConnecting))
 
@@ -288,20 +293,41 @@ func (ss *serverStream) writeToBackend() {
 				return
 			}
 			ss.bytesOut.Add(int64(len(data)))
+		case <-ss.writeCloseCh:
+			// Client closed, drain remaining data and shutdown write side
+			ss.drainAndShutdownWrite()
+			return
 		case <-ss.closeCh:
-			// Drain remaining data before exit
-			for {
-				select {
-				case data, ok := <-ss.writeCh:
-					if !ok {
-						return
-					}
-					ss.backendConn.Write(data)
-				default:
-					return
-				}
-			}
+			// Full close, drain and exit
+			ss.drainWriteCh()
+			return
 		}
+	}
+}
+
+// drainWriteCh drains remaining data from writeCh
+func (ss *serverStream) drainWriteCh() {
+	for {
+		select {
+		case data, ok := <-ss.writeCh:
+			if !ok {
+				return
+			}
+			ss.backendConn.Write(data)
+			ss.bytesOut.Add(int64(len(data)))
+		default:
+			return
+		}
+	}
+}
+
+// drainAndShutdownWrite drains writeCh and shuts down write side of backend
+func (ss *serverStream) drainAndShutdownWrite() {
+	// Drain remaining data
+	ss.drainWriteCh()
+	// Shutdown write side of backend connection to signal EOF
+	if tcpConn, ok := ss.backendConn.(*net.TCPConn); ok {
+		tcpConn.CloseWrite()
 	}
 }
 
@@ -317,7 +343,8 @@ func (ss *serverStream) readFromBackend() {
 		dataOffset := greHeaderSize + tunnel.StreamHeaderSize
 		n, err := ss.backendConn.Read(buf[dataOffset : dataOffset+maxReadSize])
 		if err != nil {
-			if err != io.EOF {
+			// Don't log EOF or closed connection errors (normal closure)
+			if err != io.EOF && !isClosedConnError(err) {
 				log.Printf("Stream %d backend read error: %v", ss.id, err)
 			}
 			break
@@ -350,14 +377,35 @@ func (ss *serverStream) readFromBackend() {
 	ss.close()
 }
 
-// close closes the stream
+// isClosedConnError checks if error is due to closed connection
+func isClosedConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
+}
+
+// closeWrite signals writer to stop (client sent StreamClose)
+func (ss *serverStream) closeWrite() {
+	select {
+	case <-ss.writeCloseCh:
+		// Already closed
+	default:
+		close(ss.writeCloseCh)
+	}
+}
+
+// close fully closes the stream
 func (ss *serverStream) close() {
 	if !ss.state.CompareAndSwap(int32(streamStateConnecting), int32(streamStateClosed)) &&
 		!ss.state.CompareAndSwap(int32(streamStateConnected), int32(streamStateClosed)) {
 		return // Already closed
 	}
 
-	// Signal close
+	// Signal write close first
+	ss.closeWrite()
+
+	// Signal full close
 	select {
 	case <-ss.closeCh:
 	default:
