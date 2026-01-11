@@ -3,6 +3,8 @@
 [![Release](https://img.shields.io/github/v/release/missuo/shadow-gre)](https://github.com/missuo/shadow-gre/releases)
 [![License](https://img.shields.io/github/license/missuo/shadow-gre)](LICENSE)
 
+English | [中文](README_CN.md)
+
 TCP over GRE tunnel - Encapsulate TCP traffic into GRE protocol (IP Protocol 47) for transmission with reliable delivery.
 
 ## Architecture
