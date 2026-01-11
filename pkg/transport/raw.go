@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/missuo/shadow-gre/pkg/gre"
 )
@@ -125,12 +126,20 @@ func (t *RawTransport) receiveLoop() {
 
 	buf := make([]byte, 65535)
 	var totalRecv, filtered, keyMismatch, delivered uint64
+	lastLog := time.Now()
 
 	for {
 		if t.closed.Load() {
 			log.Printf("Transport stats: total_recv=%d, filtered=%d, key_mismatch=%d, delivered=%d, sent=%d",
 				totalRecv, filtered, keyMismatch, delivered, t.sendCount.Load())
 			return
+		}
+
+		// Log stats every 30 seconds
+		if time.Since(lastLog) > 30*time.Second {
+			log.Printf("Transport stats: recv=%d, sent=%d, filtered=%d, key_mismatch=%d",
+				delivered, t.sendCount.Load(), filtered, keyMismatch)
+			lastLog = time.Now()
 		}
 
 		n, addr, err := t.conn.ReadFromIP(buf)
