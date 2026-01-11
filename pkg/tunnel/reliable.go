@@ -458,7 +458,8 @@ func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 	oldBase := rs.sendBase.Load()
 
 	// Check for duplicate ACK (same ACK number, no new data acked)
-	if ack == oldBase-1 && len(sackBlocks) == 0 {
+	// ACK=N means "I expect seq=N", so duplicate ACK is when ack == oldBase
+	if ack == oldBase && len(sackBlocks) == 0 {
 		rs.dupAckCount++
 		if rs.dupAckCount >= FastRetransmitCount {
 			// Fast retransmit: retransmit the first unacked packet
@@ -476,9 +477,10 @@ func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 	// New ACK, reset duplicate counter
 	rs.dupAckCount = 0
 
-	// Remove all packets up to and including ack (cumulative ACK)
+	// Remove all packets before ack (cumulative ACK)
+	// ACK=N means "I expect seq=N next", i.e., "I received 0 to N-1"
 	for seq := range rs.unacked {
-		if seqLessOrEqual(seq, ack) {
+		if seqLess(seq, ack) {
 			// Calculate RTT for packets that weren't retransmitted
 			up := rs.unacked[seq]
 			if up.retries == 0 {
@@ -499,8 +501,8 @@ func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 	}
 
 	// Update send base
-	if seqGreater(ack+1, rs.sendBase.Load()) {
-		rs.sendBase.Store(ack + 1)
+	if seqGreater(ack, rs.sendBase.Load()) {
+		rs.sendBase.Store(ack)
 	}
 }
 
