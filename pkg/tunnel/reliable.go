@@ -24,14 +24,14 @@ const (
 	MaxSackBlocks         = 4 // Maximum SACK blocks per packet
 
 	// Protocol parameters
-	DefaultWindowSize   = 512            // Maximum unacked packets (larger for high throughput)
-	DefaultRTOMs        = 100            // Initial retransmission timeout in ms
-	MinRTOMs            = 20             // Minimum RTO
+	DefaultWindowSize   = 256            // Maximum unacked packets
+	DefaultRTOMs        = 150            // Initial retransmission timeout in ms
+	MinRTOMs            = 30             // Minimum RTO
 	MaxRTOMs            = 2000           // Maximum RTO
 	MaxRetries          = 20             // Max retransmission attempts
-	AckDelayMs          = 2              // Delay before sending pure ACK
-	AckEveryN           = 2              // Send ACK every N packets (like TCP delayed ACK)
-	MaxOutOfOrderBuffer = 1024           // Max out-of-order packets to buffer
+	AckDelayMs          = 5              // Delay before sending pure ACK
+	AckEveryN           = 4              // Send ACK every N packets (like TCP delayed ACK)
+	MaxOutOfOrderBuffer = 512            // Max out-of-order packets to buffer
 	CleanupIntervalMs   = 5000           // Stream cleanup interval
 	FastRetransmitCount = 3              // Duplicate ACKs before fast retransmit
 
@@ -614,8 +614,7 @@ func (rs *ReliableStream) scheduleAck() {
 	count := rs.recvCounter.Add(1)
 	if count%AckEveryN == 0 {
 		// Send ACK immediately every N packets
-		rs.pendingAck.Store(false)
-		rs.cancelAckTimer()
+		// sendAckNow will handle pendingAck and timer
 		rs.sendAckNow()
 		return
 	}
