@@ -14,6 +14,15 @@ import (
 	"github.com/missuo/shadow-gre/pkg/tunnel"
 )
 
+const (
+	// maxReadSize must fit in MTU: 1500 - IP(20) - GRE(8) - ReliableHeader(13+SACK) = ~1450
+	// Use 1300 for safety margin with reliable headers and SACK blocks
+	maxReadSize = 1300
+	// greBufferSize needs to fit: GRE(8) + ReliableHeader(~45) + Data(1300) = ~1353
+	// Round up for alignment
+	greBufferSize = 1400
+)
+
 // clientState manages streams for a single client
 type clientState struct {
 	clientIP net.IP

@@ -114,7 +114,7 @@ func (c *Client) handleConnection(conn net.Conn) {
 	log.Printf("New connection from %s, stream ID: %d", conn.RemoteAddr(), streamID)
 
 	// Create TCP stream through gVisor stack
-	stream, err := c.tcpStackMgr.CreateStream(streamID, conn)
+	_, err := c.tcpStackMgr.CreateStream(streamID, conn)
 	if err != nil {
 		log.Printf("Failed to create stream %d: %v", streamID, err)
 		conn.Close()

@@ -73,7 +73,7 @@ func (a *IPAllocator) GetIP(streamID uint32) (tcpip.Address, bool) {
 
 // IPToStreamID converts an IP address back to streamID
 func (a *IPAllocator) IPToStreamID(addr tcpip.Address) (uint32, error) {
-	if !addr.Is4() {
+	if addr.Len() != 4 {
 		return 0, fmt.Errorf("not an IPv4 address")
 	}
 

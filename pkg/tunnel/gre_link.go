@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"fmt"
 	"log"
 	"net"
 
@@ -86,6 +85,16 @@ func (e *GRELinkEndpoint) LinkAddress() tcpip.LinkAddress {
 	return e.linkAddr
 }
 
+// SetLinkAddress implements stack.LinkEndpoint
+func (e *GRELinkEndpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.linkAddr = addr
+}
+
+// SetOnCloseAction implements stack.LinkEndpoint
+func (e *GRELinkEndpoint) SetOnCloseAction(func()) {
+	// No-op: we don't need close actions for GRE
+}
+
 // Attach implements stack.LinkEndpoint
 func (e *GRELinkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	e.dispatcher = dispatcher
@@ -108,12 +117,12 @@ func (e *GRELinkEndpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint
-func (e *GRELinkEndpoint) AddHeader(pkt stack.PacketBufferPtr) {
+func (e *GRELinkEndpoint) AddHeader(pkt *stack.PacketBuffer) {
 	// No link-layer header needed
 }
 
 // ParseHeader implements stack.LinkEndpoint
-func (e *GRELinkEndpoint) ParseHeader(pkt stack.PacketBufferPtr) bool {
+func (e *GRELinkEndpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
 	// No link-layer header to parse
 	return true
 }
@@ -132,7 +141,7 @@ func (e *GRELinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 }
 
 // writePacket sends a single packet through GRE
-func (e *GRELinkEndpoint) writePacket(pkt stack.PacketBufferPtr) tcpip.Error {
+func (e *GRELinkEndpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 	// Extract the IP packet from gVisor
 	payload := pkt.ToBuffer()
 	ipPacket := payload.Flatten()
@@ -224,6 +233,6 @@ func (e *GRELinkEndpoint) Close() {
 }
 
 // WriteRawPacket implements stack.LinkEndpoint (optional method)
-func (e *GRELinkEndpoint) WriteRawPacket(pkt stack.PacketBufferPtr) tcpip.Error {
+func (e *GRELinkEndpoint) WriteRawPacket(pkt *stack.PacketBuffer) tcpip.Error {
 	return e.writePacket(pkt)
 }

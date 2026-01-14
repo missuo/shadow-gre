@@ -1,17 +1,17 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/missuo/shadow-gre/pkg/transport"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -327,9 +327,11 @@ func (m *TCPStackManager) bridgeStream(stream *TCPStream) {
 			}
 
 			// Write to gVisor endpoint
-			r := stream.endpoint.Write(tcpip.SlicePayload(buf[:n]), tcpip.WriteOptions{})
-			if r.Err != nil {
-				log.Printf("Failed to write to gVisor endpoint: %v", r.Err)
+			// bytes.Reader implements io.Reader and has Len() method
+			reader := bytes.NewReader(buf[:n])
+			_, writeErr := stream.endpoint.Write(reader, tcpip.WriteOptions{})
+			if writeErr != nil {
+				log.Printf("Failed to write to gVisor endpoint: %v", writeErr)
 				return
 			}
 		}
@@ -342,10 +344,12 @@ func (m *TCPStackManager) bridgeStream(stream *TCPStream) {
 		stream.wq.EventRegister(&waitEntry)
 		defer stream.wq.EventUnregister(&waitEntry)
 
+		buf := make([]byte, 32*1024)
 		for {
-			res := stream.endpoint.Read(io.Discard, tcpip.ReadOptions{})
-			if res.Err != nil {
-				if _, ok := res.Err.(*tcpip.ErrWouldBlock); ok {
+			// Read directly into buffer
+			n, readErr := stream.endpoint.Read(buffer.NewViewWithData(buf), tcpip.ReadOptions{})
+			if readErr != nil {
+				if _, ok := readErr.(*tcpip.ErrWouldBlock); ok {
 					// Wait for data
 					select {
 					case <-notifyCh:
@@ -358,9 +362,8 @@ func (m *TCPStackManager) bridgeStream(stream *TCPStream) {
 			}
 
 			// Write to app connection
-			if res.Count > 0 {
-				data := res.Buffer.Flatten()
-				if _, err := stream.appConn.Write(data); err != nil {
+			if n.Count > 0 {
+				if _, err := stream.appConn.Write(buf[:n.Count]); err != nil {
 					return
 				}
 			}
@@ -539,9 +542,9 @@ func (m *TCPStackManager) handleAcceptedConnection(ep tcpip.Endpoint, wq *waiter
 	}
 
 	// Extract streamID from remote IP
-	streamID, err := m.ipAllocator.IPToStreamID(remoteAddr.Addr)
-	if err != nil {
-		log.Printf("Failed to extract streamID from IP: %v", err)
+	streamID, streamErr := m.ipAllocator.IPToStreamID(remoteAddr.Addr)
+	if streamErr != nil {
+		log.Printf("Failed to extract streamID from IP: %v", streamErr)
 		return
 	}
 
