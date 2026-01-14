@@ -72,13 +72,15 @@ func (a *IPAllocator) GetIP(streamID uint32) (tcpip.Address, bool) {
 }
 
 // IPToStreamID converts an IP address back to streamID
+// Accepts both client (10.255.x.x) and server (10.254.x.x) IP ranges
 func (a *IPAllocator) IPToStreamID(addr tcpip.Address) (uint32, error) {
 	if addr.Len() != 4 {
 		return 0, fmt.Errorf("not an IPv4 address")
 	}
 
 	ip := addr.As4()
-	if ip[0] != 10 || ip[1] != a.prefix {
+	// Accept both client (255) and server (254) prefixes
+	if ip[0] != 10 || (ip[1] != 254 && ip[1] != 255) {
 		return 0, fmt.Errorf("IP not in allocation range")
 	}
 
