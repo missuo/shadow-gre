@@ -350,10 +350,10 @@ func (m *TCPStackManager) bridgeStream(stream *TCPStream) {
 		stream.wq.EventRegister(&waitEntry)
 		defer stream.wq.EventUnregister(&waitEntry)
 
-		buf := make([]byte, 32*1024)
 		for {
-			// Read directly into buffer
-			n, readErr := stream.endpoint.Read(buffer.NewViewWithData(buf), tcpip.ReadOptions{})
+			// Create empty view for reading - gVisor will append data to it
+			var view buffer.View
+			_, readErr := stream.endpoint.Read(&view, tcpip.ReadOptions{})
 			if readErr != nil {
 				if _, ok := readErr.(*tcpip.ErrWouldBlock); ok {
 					// Wait for data
@@ -368,8 +368,9 @@ func (m *TCPStackManager) bridgeStream(stream *TCPStream) {
 			}
 
 			// Write to app connection
-			if n.Count > 0 {
-				if _, err := stream.appConn.Write(buf[:n.Count]); err != nil {
+			data := view.AsSlice()
+			if len(data) > 0 {
+				if _, err := stream.appConn.Write(data); err != nil {
 					return
 				}
 			}

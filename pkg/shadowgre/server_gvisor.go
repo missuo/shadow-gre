@@ -184,15 +184,15 @@ func (s *ServerGVisor) bridgeConnections(streamID uint32, ep tcpip.Endpoint, wq 
 	// gVisor -> Backend
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32*1024)
 
 		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents)
 		wq.EventRegister(&waitEntry)
 		defer wq.EventUnregister(&waitEntry)
 
 		for {
-			view := buffer.NewViewWithData(buf)
-			res, err := ep.Read(view, tcpip.ReadOptions{})
+			// Create empty view for reading - gVisor will append data to it
+			var view buffer.View
+			res, err := ep.Read(&view, tcpip.ReadOptions{})
 			if err != nil {
 				if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 					<-notifyCh
@@ -208,13 +208,10 @@ func (s *ServerGVisor) bridgeConnections(streamID uint32, ep tcpip.Endpoint, wq 
 				continue
 			}
 
-			// Get data from view, not from buf - View may use its own storage
+			// Get data from view
 			data := view.AsSlice()
-			if len(data) == 0 {
-				data = buf[:res.Count]
-			}
-			log.Printf("Stream %d: read %d bytes from gVisor (view.Size=%d), first bytes: %x",
-				streamID, res.Count, view.Size(), data[:min(16, len(data))])
+			log.Printf("Stream %d: read %d bytes from gVisor, first bytes: %x",
+				streamID, len(data), data[:min(16, len(data))])
 			if _, err := backendConn.Write(data); err != nil {
 				log.Printf("Stream %d: backend write error: %v", streamID, err)
 				break
