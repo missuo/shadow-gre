@@ -81,6 +81,12 @@ func (s *ServerGVisor) handleGREPacket(clientIP net.IP, payload []byte) {
 		return
 	}
 
+	// Debug: log packet info
+	if len(reliablePkt.Data) > 0 {
+		log.Printf("GRE packet from %s: streamID=%d, flags=0x%02x, seq=%d, dataLen=%d",
+			clientIP, reliablePkt.StreamID, reliablePkt.Flags, reliablePkt.Seq, len(reliablePkt.Data))
+	}
+
 	// Get or create client TCP state
 	clientState := s.getOrCreateClient(clientIP)
 	if clientState == nil {
@@ -203,6 +209,7 @@ func (s *ServerGVisor) bridgeConnections(streamID uint32, ep tcpip.Endpoint, wq 
 			}
 
 			data := buf[:res.Count]
+			log.Printf("Stream %d: read %d bytes from gVisor, forwarding to backend", streamID, res.Count)
 			if _, err := backendConn.Write(data); err != nil {
 				log.Printf("Stream %d: backend write error: %v", streamID, err)
 				break
