@@ -230,9 +230,12 @@ func (m *TCPStackManager) CreateStream(streamID uint32, appConn net.Conn) (*TCPS
 		return nil, fmt.Errorf("stream %d already exists", streamID)
 	}
 
-	// Allocate virtual IPs
+	// Allocate virtual IP for this client stream
 	localIP := m.ipAllocator.AllocateIP(streamID)
-	remoteIP := m.ipAllocator.AllocateIP(streamID + 0x10000) // Use different range for remote
+
+	// Remote IP is always the server's listening address (10.254.0.0)
+	// The server listens on 10.254.0.0:80
+	remoteIP := tcpip.AddrFrom4([4]byte{10, 254, 0, 0})
 
 	// Add IP address to NIC
 	protocolAddr := tcpip.ProtocolAddress{
@@ -250,7 +253,7 @@ func (m *TCPStackManager) CreateStream(streamID uint32, appConn net.Conn) (*TCPS
 		return nil, fmt.Errorf("failed to create endpoint: %v", err)
 	}
 
-	// Bind to local address
+	// Bind to local address with dynamic port
 	localAddr := tcpip.FullAddress{
 		NIC:  nicID,
 		Addr: localIP,
@@ -261,11 +264,11 @@ func (m *TCPStackManager) CreateStream(streamID uint32, appConn net.Conn) (*TCPS
 		return nil, fmt.Errorf("failed to bind: %v", err)
 	}
 
-	// Connect to remote address
+	// Connect to server's listening address
 	remoteAddr := tcpip.FullAddress{
 		NIC:  nicID,
 		Addr: remoteIP,
-		Port: uint16(20000 + streamID%10000),
+		Port: 80, // Server listens on port 80
 	}
 
 	// Wait for connection to complete
