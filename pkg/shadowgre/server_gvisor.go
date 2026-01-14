@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/missuo/shadow-gre/pkg/gre"
 	"github.com/missuo/shadow-gre/pkg/transport"
 	"github.com/missuo/shadow-gre/pkg/tunnel"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -69,20 +68,16 @@ func (s *ServerGVisor) Start() error {
 }
 
 // handleGREPacket handles incoming GRE packets from clients
+// Note: payload is already unwrapped from GRE by ServerTransport
 func (s *ServerGVisor) handleGREPacket(clientIP net.IP, payload []byte) {
 	if s.closed.Load() {
 		return
 	}
 
-	// Unwrap GRE packet
-	grePacket, err := gre.UnmarshalPacket(payload)
+	// Unwrap ReliablePacket (payload is already GRE-unwrapped)
+	reliablePkt, err := tunnel.UnmarshalReliable(payload)
 	if err != nil {
-		return
-	}
-
-	// Unwrap ReliablePacket
-	reliablePkt, err := tunnel.UnmarshalReliable(grePacket.Payload)
-	if err != nil {
+		log.Printf("Failed to unmarshal ReliablePacket from %s: %v", clientIP, err)
 		return
 	}
 
