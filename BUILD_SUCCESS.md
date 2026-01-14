@@ -4,9 +4,11 @@
 
 **状态**: SUCCESS ✅
 **二进制大小**: 6.8 MB
-**编译时间**: 2026-01-14 21:45
+**编译时间**: 2026-01-14 21:49
 **分支**: refactor/gvisor-tcp-stack
-**提交**: 47e8217
+**提交**: 5740619
+**测试状态**: ✅ All tests pass
+**Lint 状态**: ✅ go vet clean
 
 ## 🔧 修复的问题
 
@@ -43,6 +45,15 @@
 8. **编译冲突**
    - ❌ 错误: client_old.go 与 client.go 冲突
    - ✅ 修复: 重命名为 client_old.go.bak
+
+9. **Mutex 拷贝问题** (NEW)
+   - ❌ 错误: `literal copies lock value from wq: waiter.Queue contains sync.RWMutex`
+   - ✅ 修复: 将 `TCPStream.wq` 改为 `*waiter.Queue` 指针类型
+   - 影响: tcp_stack.go:296
+
+10. **CI/CD Go 版本**
+   - ⚠️  问题: GitHub Actions 使用 Go 1.23
+   - ✅ 修复: 统一使用 Go 1.22 (与 go.mod 兼容)
 
 ## 📊 代码统计
 
@@ -123,6 +134,8 @@ wrk -t4 -c100 -d30s --latency http://example.com
 ## 📝 提交历史
 
 ```
+5740619 - fix: resolve mutex copy issue and update CI configuration (LATEST)
+a09334c - docs: add build success report
 47e8217 - fix(tunnel): resolve all gVisor API compatibility issues
 3caa436 - ci(actions): add build workflow for all branches
 8f7cd63 - feat(tunnel): refactor with gVisor TCP stack for better performance
