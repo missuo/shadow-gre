@@ -208,8 +208,13 @@ func (s *ServerGVisor) bridgeConnections(streamID uint32, ep tcpip.Endpoint, wq 
 				continue
 			}
 
-			data := buf[:res.Count]
-			log.Printf("Stream %d: read %d bytes from gVisor, forwarding to backend", streamID, res.Count)
+			// Get data from view, not from buf - View may use its own storage
+			data := view.AsSlice()
+			if len(data) == 0 {
+				data = buf[:res.Count]
+			}
+			log.Printf("Stream %d: read %d bytes from gVisor (view.Size=%d), first bytes: %x",
+				streamID, res.Count, view.Size(), data[:min(16, len(data))])
 			if _, err := backendConn.Write(data); err != nil {
 				log.Printf("Stream %d: backend write error: %v", streamID, err)
 				break
