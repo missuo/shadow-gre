@@ -43,6 +43,9 @@ type TCPStackManager struct {
 	// Listener for incoming connections (server mode)
 	listener *tcpip.Endpoint
 
+	// Callback for accepted connections (server mode)
+	onAccept func(streamID uint32, ep tcpip.Endpoint, wq *waiter.Queue)
+
 	// Shutdown
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -432,6 +435,14 @@ func (m *TCPStackManager) Close() error {
 	return nil
 }
 
+// DeliverPacket delivers a ReliablePacket to the gVisor stack
+// This is called when receiving packets from the network
+func (m *TCPStackManager) DeliverPacket(reliablePkt *ReliablePacket) {
+	if m.linkEP != nil {
+		m.linkEP.DeliverReliablePacket(reliablePkt)
+	}
+}
+
 // GetStack returns the underlying gVisor stack (for advanced usage)
 func (m *TCPStackManager) GetStack() *stack.Stack {
 	return m.stack
@@ -442,6 +453,11 @@ func (m *TCPStackManager) StreamCount() int {
 	m.streamsMu.RLock()
 	defer m.streamsMu.RUnlock()
 	return len(m.streams)
+}
+
+// SetAcceptCallback sets the callback for accepted connections (server mode)
+func (m *TCPStackManager) SetAcceptCallback(cb func(streamID uint32, ep tcpip.Endpoint, wq *waiter.Queue)) {
+	m.onAccept = cb
 }
 
 // Listen starts listening for incoming TCP connections (server mode)
@@ -532,12 +548,12 @@ func (m *TCPStackManager) acceptLoop(listener *tcpip.Endpoint, wq *waiter.Queue)
 // handleAcceptedConnection handles an accepted connection from gVisor
 func (m *TCPStackManager) handleAcceptedConnection(ep tcpip.Endpoint, wq *waiter.Queue) {
 	defer m.wg.Done()
-	defer ep.Close()
 
 	// Get the remote address to determine streamID
 	remoteAddr, err := ep.GetRemoteAddress()
 	if err != nil {
 		log.Printf("Failed to get remote address: %v", err)
+		ep.Close()
 		return
 	}
 
@@ -545,13 +561,17 @@ func (m *TCPStackManager) handleAcceptedConnection(ep tcpip.Endpoint, wq *waiter
 	streamID, streamErr := m.ipAllocator.IPToStreamID(remoteAddr.Addr)
 	if streamErr != nil {
 		log.Printf("Failed to extract streamID from IP: %v", streamErr)
+		ep.Close()
 		return
 	}
 
 	log.Printf("Accepted gVisor connection for stream %d", streamID)
 
-	// This connection needs to be forwarded to backend
-	// The actual forwarding logic will be in the server code
-	// For now, we just store the endpoint
-	// TODO: Add callback mechanism for server to handle accepted connections
+	// Call the accept callback if set
+	if m.onAccept != nil {
+		m.onAccept(streamID, ep, wq)
+	} else {
+		// No handler, just close
+		ep.Close()
+	}
 }

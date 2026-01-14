@@ -123,7 +123,7 @@ func runServer(local net.IP, backend string, key uint32) {
 		os.Exit(1)
 	}
 
-	server := shadowgre.NewServer(local, backend, key)
+	server := shadowgre.NewServerGVisor(local, backend, key)
 
 	if err := server.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)

@@ -3,6 +3,8 @@ package tunnel
 import (
 	"log"
 	"net"
+	"sync"
+	"sync/atomic"
 
 	"github.com/missuo/shadow-gre/pkg/gre"
 	"github.com/missuo/shadow-gre/pkg/transport"
@@ -14,6 +16,7 @@ import (
 
 // GRELinkEndpoint implements stack.LinkEndpoint for GRE transport
 // It acts as a "virtual network card" that sends/receives packets through GRE
+// The IP packets from gVisor are wrapped in ReliablePacket for transmission
 type GRELinkEndpoint struct {
 	// Network dispatcher from netstack
 	dispatcher stack.NetworkDispatcher
@@ -25,32 +28,36 @@ type GRELinkEndpoint struct {
 	mtu uint32
 
 	// Underlying GRE transport (either RawTransport or ServerTransport)
-	rawTransport   *transport.RawTransport
+	rawTransport    *transport.RawTransport
 	serverTransport *transport.ServerTransport
-	isServer       bool
-	clientIP       net.IP // For server mode: which client to send to
+	isServer        bool
+	clientIP        net.IP // For server mode: which client to send to
 
 	// Capabilities
 	capabilities stack.LinkEndpointCapabilities
 
 	// Attached flag
 	attached bool
+
+	// Sequence numbers per stream for reliable layer
+	streamSeqNums sync.Map // map[uint32]*atomic.Uint32
 }
 
 // NewGRELinkEndpoint creates a link endpoint for client mode
 func NewGRELinkEndpoint(transport *transport.RawTransport) *GRELinkEndpoint {
-	return &GRELinkEndpoint{
+	e := &GRELinkEndpoint{
 		linkAddr:     generateLinkAddr(true),
-		mtu:          1400, // Conservative MTU: 1500 - GRE(8) - outer IP(20) - safety margin
+		mtu:          1400, // Conservative MTU: 1500 - GRE(8) - outer IP(20) - reliable header - safety margin
 		rawTransport: transport,
 		isServer:     false,
 		capabilities: stack.CapabilityRXChecksumOffload | stack.CapabilityTXChecksumOffload,
 	}
+	return e
 }
 
 // NewGRELinkEndpointServer creates a link endpoint for server mode
 func NewGRELinkEndpointServer(transport *transport.ServerTransport, clientIP net.IP) *GRELinkEndpoint {
-	return &GRELinkEndpoint{
+	e := &GRELinkEndpoint{
 		linkAddr:        generateLinkAddr(false),
 		mtu:             1400,
 		serverTransport: transport,
@@ -58,6 +65,7 @@ func NewGRELinkEndpointServer(transport *transport.ServerTransport, clientIP net
 		isServer:        true,
 		capabilities:    stack.CapabilityRXChecksumOffload | stack.CapabilityTXChecksumOffload,
 	}
+	return e
 }
 
 // MTU implements stack.LinkEndpoint
@@ -140,42 +148,69 @@ func (e *GRELinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 	return n, nil
 }
 
-// writePacket sends a single packet through GRE
+// writePacket sends a single packet through GRE wrapped in ReliablePacket format
 func (e *GRELinkEndpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 	// Extract the IP packet from gVisor
 	payload := pkt.ToBuffer()
 	ipPacket := payload.Flatten()
 
+	// Parse IP header to extract source IP (which encodes the stream ID)
+	if len(ipPacket) < header.IPv4MinimumSize {
+		return &tcpip.ErrInvalidEndpointState{}
+	}
+
+	// Extract source IP address (contains stream ID in last 2 bytes)
+	srcIP := header.IPv4(ipPacket).SourceAddress()
+	streamID := uint32(srcIP.As4()[2])<<8 | uint32(srcIP.As4()[3])
+
+	// Get or create sequence number counter for this stream
+	seqNumI, _ := e.streamSeqNums.LoadOrStore(streamID, &atomic.Uint32{})
+	seqNum := seqNumI.(*atomic.Uint32)
+	seq := seqNum.Add(1)
+
+	// Wrap in ReliablePacket format
+	// The TCP layer handles reliability, so we just wrap for stream multiplexing
+	reliablePkt := &ReliablePacket{
+		StreamID: streamID,
+		Flags:    FlagData, // Just data, no ACK needed since TCP handles reliability
+		Seq:      seq,
+		Data:     ipPacket,
+	}
+
+	reliableData := reliablePkt.Marshal()
+
 	// Send through GRE transport
 	var err error
 	if e.isServer {
-		err = e.serverTransport.Send(e.clientIP, ipPacket)
+		err = e.serverTransport.Send(e.clientIP, reliableData)
 	} else {
-		err = e.rawTransport.Send(ipPacket)
+		err = e.rawTransport.Send(reliableData)
 	}
 
 	if err != nil {
-		log.Printf("Failed to send GRE packet: %v", err)
+		log.Printf("Failed to send GRE packet for stream %d: %v", streamID, err)
 		return &tcpip.ErrAborted{}
 	}
 
 	return nil
 }
 
-// DeliverNetworkPacket is called when receiving a packet from GRE
-// This injects the packet into gVisor's network stack
-func (e *GRELinkEndpoint) DeliverNetworkPacket(payload []byte) {
+// DeliverReliablePacket is called when receiving a ReliablePacket
+// It unwraps the IP packet and injects it into gVisor's network stack
+func (e *GRELinkEndpoint) DeliverReliablePacket(reliablePkt *ReliablePacket) {
 	if !e.attached || e.dispatcher == nil {
 		return
 	}
 
-	// Parse IP version
-	if len(payload) < 1 {
+	// Extract IP packet from reliable packet
+	ipPacket := reliablePkt.Data
+	if len(ipPacket) < 1 {
 		return
 	}
 
+	// Parse IP version
 	var protocol tcpip.NetworkProtocolNumber
-	ipVersion := header.IPVersion(payload)
+	ipVersion := header.IPVersion(ipPacket)
 
 	switch ipVersion {
 	case header.IPv4Version:
@@ -183,12 +218,12 @@ func (e *GRELinkEndpoint) DeliverNetworkPacket(payload []byte) {
 	case header.IPv6Version:
 		protocol = header.IPv6ProtocolNumber
 	default:
-		log.Printf("Unknown IP version: %d", ipVersion)
+		log.Printf("Unknown IP version: %d (streamID: %d, seq: %d)", ipVersion, reliablePkt.StreamID, reliablePkt.Seq)
 		return
 	}
 
 	// Create packet buffer from received data
-	buf := buffer.MakeWithData(payload)
+	buf := buffer.MakeWithData(reliablePkt.Data)
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buf,
 	})
@@ -201,18 +236,28 @@ func (e *GRELinkEndpoint) DeliverNetworkPacket(payload []byte) {
 // SetupReceiveHandler sets up the GRE receive handler to deliver packets to gVisor
 func (e *GRELinkEndpoint) SetupReceiveHandler() {
 	if e.isServer {
-		// Server mode: receive handler is set per-client in ServerTransport
-		// We'll handle this in TCPStackManager
+		// Server mode: receive handler will be set per-client by TCPStackManager
+		// The server needs to handle packets from multiple clients
+		// This is handled in the server's packet receive loop
 	} else {
 		// Client mode: set receive handler on RawTransport
 		e.rawTransport.SetReceiveHandler(func(payload []byte) {
 			// Unwrap GRE packet
-			packet, err := gre.UnmarshalPacket(payload)
+			grePacket, err := gre.UnmarshalPacket(payload)
 			if err != nil {
+				log.Printf("Failed to unmarshal GRE packet: %v", err)
 				return
 			}
-			// Deliver the inner IP packet to gVisor
-			e.DeliverNetworkPacket(packet.Payload)
+
+			// Unwrap ReliablePacket
+			reliablePkt, err := UnmarshalReliable(grePacket.Payload)
+			if err != nil {
+				log.Printf("Failed to unmarshal ReliablePacket: %v", err)
+				return
+			}
+
+			// Deliver the IP packet to gVisor
+			e.DeliverReliablePacket(reliablePkt)
 		})
 	}
 }
