@@ -53,7 +53,7 @@ type TCPStackManager struct {
 type TCPStream struct {
 	streamID   uint32
 	endpoint   tcpip.Endpoint
-	wq         waiter.Queue
+	wq         *waiter.Queue
 	localAddr  tcpip.FullAddress
 	remoteAddr tcpip.FullAddress
 
@@ -293,7 +293,7 @@ func (m *TCPStackManager) CreateStream(streamID uint32, appConn net.Conn) (*TCPS
 	stream := &TCPStream{
 		streamID:   streamID,
 		endpoint:   ep,
-		wq:         wq,
+		wq:         &wq,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
 		appConn:    appConn,

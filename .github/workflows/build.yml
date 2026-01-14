@@ -28,7 +28,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'  # Adjust to match your go.mod version
+          go-version: '1.22'  # Match go.mod requirement (1.21+)
           cache: true
 
       - name: Get dependencies
@@ -59,7 +59,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.22'
           cache: true
 
       - name: Get dependencies
@@ -81,7 +81,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.22'
           cache: true
 
       - name: Run golangci-lint
