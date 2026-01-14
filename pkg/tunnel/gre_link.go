@@ -6,7 +6,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/missuo/shadow-gre/pkg/gre"
 	"github.com/missuo/shadow-gre/pkg/transport"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -241,16 +240,10 @@ func (e *GRELinkEndpoint) SetupReceiveHandler() {
 		// This is handled in the server's packet receive loop
 	} else {
 		// Client mode: set receive handler on RawTransport
+		// Note: RawTransport already unwraps GRE, payload is ReliablePacket data
 		e.rawTransport.SetReceiveHandler(func(payload []byte) {
-			// Unwrap GRE packet
-			grePacket, err := gre.UnmarshalPacket(payload)
-			if err != nil {
-				log.Printf("Failed to unmarshal GRE packet: %v", err)
-				return
-			}
-
-			// Unwrap ReliablePacket
-			reliablePkt, err := UnmarshalReliable(grePacket.Payload)
+			// Unwrap ReliablePacket (payload is already GRE-unwrapped)
+			reliablePkt, err := UnmarshalReliable(payload)
 			if err != nil {
 				log.Printf("Failed to unmarshal ReliablePacket: %v", err)
 				return
