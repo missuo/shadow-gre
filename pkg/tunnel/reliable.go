@@ -23,21 +23,35 @@ const (
 	ReliableHeaderWithAck = 13
 	MaxSackBlocks         = 4 // Maximum SACK blocks per packet
 
-	// Protocol parameters
-	DefaultWindowSize   = 256  // Maximum unacked packets
-	DefaultRTOMs        = 150  // Initial retransmission timeout in ms
-	MinRTOMs            = 30   // Minimum RTO
-	MaxRTOMs            = 2000 // Maximum RTO
-	MaxRetries          = 20   // Max retransmission attempts
-	AckDelayMs          = 5    // Delay before sending pure ACK
-	AckEveryN           = 4    // Send ACK every N packets (like TCP delayed ACK)
-	MaxOutOfOrderBuffer = 512  // Max out-of-order packets to buffer
-	CleanupIntervalMs   = 5000 // Stream cleanup interval
-	FastRetransmitCount = 3    // Duplicate ACKs before fast retransmit
+	// Congestion-control window (in packets)
+	InitialCwnd     = 32    // Initial cwnd (slow start)
+	MinCwnd         = 8     // Floor
+	MaxCwnd         = 16384 // Hard cap
+	DefaultSsthresh = 1024  // Slow-start threshold seed
+
+	// Backwards compat (kept for tests / external readers)
+	DefaultWindowSize = MaxCwnd
+
+	DefaultRTOMs        = 1000  // Initial RTO before any RTT sample (RFC 6298)
+	MinRTOMs            = 100   // Minimum RTO (avoid spurious retransmits)
+	MaxRTOMs            = 4000  // Maximum RTO
+	MaxRetries          = 20    // Max retransmission attempts
+	AckDelayMs          = 5     // Delay before sending pure ACK
+	AckEveryN           = 4     // Send ACK every N packets (like TCP delayed ACK)
+	MaxOutOfOrderBuffer = 16384 // Max out-of-order packets to buffer
+	CleanupIntervalMs   = 5000  // Stream cleanup interval
+	FastRetransmitCount = 3     // Duplicate ACKs before fast retransmit
 
 	// RTT estimation parameters (RFC 6298)
 	RTTAlpha = 0.125 // SRTT smoothing factor
 	RTTBeta  = 0.25  // RTTVAR smoothing factor
+
+	// Pacing. We pace sends at cwnd/SRTT × gain. Disabled by default because
+	// the OS sleep granularity (~100µs+) makes fine-grained pacing harmful at
+	// any reasonable cwnd, and the cwnd window itself already rate-limits sends.
+	// Set MinPacingIntervalNs lower to re-enable.
+	PacingGain          = 1.0
+	MinPacingIntervalNs = 1 << 62 // effectively disabled
 )
 
 // SackBlock represents a range of received out-of-order packets
@@ -259,6 +273,16 @@ func (r *RTTEstimator) RTO() int {
 	return int(r.rto)
 }
 
+// SRTT returns the smoothed RTT in milliseconds (0 if no sample yet)
+func (r *RTTEstimator) SRTT() float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.hasRTT {
+		return 0
+	}
+	return r.srtt
+}
+
 // Backoff doubles the RTO (for retransmission)
 func (r *RTTEstimator) Backoff() {
 	r.mu.Lock()
@@ -283,11 +307,23 @@ type ReliableStream struct {
 	// Sender state
 	sendSeq      atomic.Uint32 // Next sequence to send
 	sendBase     atomic.Uint32 // Oldest unacked sequence
-	sendWindow   int           // Window size
 	unacked      map[uint32]*unackedPacket
 	unackedMu    sync.Mutex
 	dupAckCount  int       // Duplicate ACK counter for fast retransmit
 	lastSackTime time.Time // Last SACK-based retransmit time (for rate limiting)
+
+	// Congestion control (AIMD with slow start)
+	cwnd             atomic.Int32 // current congestion window (packets)
+	ssthresh         atomic.Int32 // slow-start threshold (packets)
+	caAccum          atomic.Int32 // fractional accumulator for CA: cwnd += 1/cwnd per ACK
+	lastLossReduceNs atomic.Int64 // unix-nanos of last cwnd reduction (for per-RTT rate-limit)
+
+	// Window-available signaller. Buffered with capacity 1: ACK handler signals,
+	// Send waits on it instead of polling.
+	windowAvail chan struct{}
+
+	// Pacing: earliest unix-nanos at which next Send may release a packet
+	nextSendTimeNs atomic.Int64
 
 	// Receiver state
 	recvNext     atomic.Uint32     // Next expected sequence
@@ -317,23 +353,184 @@ type ReliableStream struct {
 	packetsOut  atomic.Uint64
 }
 
+// sendWindow returns current cwnd as int (compat with tests).
+func (rs *ReliableStream) sendWindow() int {
+	return int(rs.cwnd.Load())
+}
+
 // NewReliableStream creates a new reliable stream
 func NewReliableStream(streamID uint32, sendFunc func([]byte) error, deliverFunc func([]byte)) *ReliableStream {
 	rs := &ReliableStream{
 		streamID:     streamID,
-		sendWindow:   DefaultWindowSize,
 		unacked:      make(map[uint32]*unackedPacket),
 		outOfOrder:   make(map[uint32][]byte),
 		sendFunc:     sendFunc,
 		deliverFunc:  deliverFunc,
 		closeCh:      make(chan struct{}),
 		rttEstimator: NewRTTEstimator(),
+		windowAvail:  make(chan struct{}, 1),
 	}
+	rs.cwnd.Store(InitialCwnd)
+	rs.ssthresh.Store(DefaultSsthresh)
 
 	// Start retransmission timer
 	go rs.retransmitLoop()
 
 	return rs
+}
+
+// signalWindowAvail wakes any Send waiter (non-blocking).
+func (rs *ReliableStream) signalWindowAvail() {
+	select {
+	case rs.windowAvail <- struct{}{}:
+	default:
+	}
+}
+
+// waitForWindow blocks until cwnd has space, the stream closes, or 100ms safety timeout.
+func (rs *ReliableStream) waitForWindow(seq uint32) bool {
+	for {
+		if rs.closed.Load() {
+			return false
+		}
+		cwnd := rs.cwnd.Load()
+		// Signed diff handles the rare case where sendBase has already
+		// advanced past seq (multi-writer racing with an in-flight ACK).
+		inFlight := int32(seq - rs.sendBase.Load())
+		if inFlight < cwnd {
+			return true
+		}
+		// Drain any stale signal first, then wait for new one
+		select {
+		case <-rs.windowAvail:
+			continue
+		default:
+		}
+		select {
+		case <-rs.windowAvail:
+		case <-rs.closeCh:
+			return false
+		case <-time.After(100 * time.Millisecond):
+			// Safety net: retransmitLoop may need to free packets via timeout
+		}
+	}
+}
+
+// pace blocks (if needed) so that consecutive sends respect cwnd/RTT pacing.
+// Pacing rate = cwnd / SRTT * gain. Skipped when interval too small or SRTT unknown.
+func (rs *ReliableStream) pace() {
+	srttMs := rs.rttEstimator.SRTT()
+	if srttMs <= 0 {
+		return
+	}
+	cwnd := rs.cwnd.Load()
+	if cwnd <= 0 {
+		return
+	}
+	intervalNs := int64(srttMs * 1e6 / float64(cwnd) / PacingGain)
+	if intervalNs < MinPacingIntervalNs {
+		return
+	}
+	now := time.Now().UnixNano()
+	for {
+		next := rs.nextSendTimeNs.Load()
+		var newNext int64
+		if next <= now {
+			newNext = now + intervalNs
+		} else {
+			newNext = next + intervalNs
+		}
+		if rs.nextSendTimeNs.CompareAndSwap(next, newNext) {
+			if next > now {
+				sleep := next - now
+				if sleep > int64(50*time.Millisecond) {
+					sleep = int64(50 * time.Millisecond)
+				}
+				time.Sleep(time.Duration(sleep))
+			}
+			return
+		}
+	}
+}
+
+// onAckAdvance updates cwnd when sendBase moves forward by pktsAcked packets.
+// Implements slow-start (until ssthresh) then AIMD congestion-avoidance.
+func (rs *ReliableStream) onAckAdvance(pktsAcked int32) {
+	if pktsAcked <= 0 {
+		return
+	}
+	cwnd := rs.cwnd.Load()
+	ssthresh := rs.ssthresh.Load()
+	if cwnd < ssthresh {
+		// Slow start: cwnd += pktsAcked
+		cwnd += pktsAcked
+		if cwnd > MaxCwnd {
+			cwnd = MaxCwnd
+		}
+		rs.cwnd.Store(cwnd)
+	} else {
+		// Congestion avoidance: add pktsAcked / cwnd, using fractional accumulator
+		accum := rs.caAccum.Add(pktsAcked)
+		if accum >= cwnd {
+			inc := accum / cwnd
+			rs.caAccum.Add(-inc * cwnd)
+			cwnd += inc
+			if cwnd > MaxCwnd {
+				cwnd = MaxCwnd
+			}
+			rs.cwnd.Store(cwnd)
+		}
+	}
+}
+
+// onLossFast reduces cwnd on fast retransmit (loss inferred from SACK / dup-ACKs).
+// Rate-limited so a single loss episode only reduces cwnd once.
+func (rs *ReliableStream) onLossFast() {
+	now := time.Now().UnixNano()
+	last := rs.lastLossReduceNs.Load()
+	srttMs := rs.rttEstimator.SRTT()
+	if srttMs <= 0 {
+		srttMs = float64(rs.rttEstimator.RTO())
+	}
+	if int64(now-last) < int64(srttMs*1e6) {
+		return // already reduced within the last RTT
+	}
+	if !rs.lastLossReduceNs.CompareAndSwap(last, now) {
+		return
+	}
+	cwnd := rs.cwnd.Load()
+	newCwnd := cwnd / 2
+	if newCwnd < MinCwnd {
+		newCwnd = MinCwnd
+	}
+	rs.ssthresh.Store(newCwnd)
+	rs.cwnd.Store(newCwnd)
+	rs.caAccum.Store(0)
+}
+
+// onLossRTO reduces cwnd on RTO timeout. Halves cwnd (less catastrophic than
+// dropping to MinCwnd), also rate-limited per RTT.
+func (rs *ReliableStream) onLossRTO() {
+	now := time.Now().UnixNano()
+	last := rs.lastLossReduceNs.Load()
+	srttMs := rs.rttEstimator.SRTT()
+	if srttMs <= 0 {
+		srttMs = float64(rs.rttEstimator.RTO())
+	}
+	if int64(now-last) < int64(srttMs*1e6) {
+		return
+	}
+	if !rs.lastLossReduceNs.CompareAndSwap(last, now) {
+		return
+	}
+	cwnd := rs.cwnd.Load()
+	newSsthresh := cwnd / 2
+	if newSsthresh < MinCwnd {
+		newSsthresh = MinCwnd
+	}
+	rs.ssthresh.Store(newSsthresh)
+	rs.cwnd.Store(newSsthresh)
+	rs.caAccum.Store(0)
 }
 
 // Send sends data reliably
@@ -345,18 +542,13 @@ func (rs *ReliableStream) Send(data []byte) error {
 	// Get sequence number
 	seq := rs.sendSeq.Add(1) - 1
 
-	// Check window
-	for seq-rs.sendBase.Load() >= uint32(rs.sendWindow) {
-		// Window full, wait a bit
-		select {
-		case <-rs.closeCh:
-			return ErrStreamClosed
-		case <-time.After(10 * time.Millisecond):
-		}
-		if rs.closed.Load() {
-			return ErrStreamClosed
-		}
+	// Wait for window space (signal-based)
+	if !rs.waitForWindow(seq) {
+		return ErrStreamClosed
 	}
+
+	// Pace
+	rs.pace()
 
 	// Create packet
 	pkt := &ReliablePacket{
@@ -380,14 +572,14 @@ func (rs *ReliableStream) Send(data []byte) error {
 		rs.cancelAckTimer()
 	}
 
-	// Marshal
-	pktData := pkt.Marshal()
+	// Marshal once; the buffer is held for retransmission.
+	buf := pkt.Marshal()
 
 	// Store for retransmission
 	rs.unackedMu.Lock()
 	rs.unacked[seq] = &unackedPacket{
 		pkt:      pkt,
-		data:     pktData,
+		data:     buf,
 		sentTime: time.Now(),
 	}
 	rs.unackedMu.Unlock()
@@ -395,7 +587,7 @@ func (rs *ReliableStream) Send(data []byte) error {
 	rs.packetsOut.Add(1)
 
 	// Send
-	return rs.sendFunc(pktData)
+	return rs.sendFunc(buf)
 }
 
 // SendClose sends a close packet
@@ -453,6 +645,57 @@ func (rs *ReliableStream) Receive(pkt *ReliablePacket) (isClose bool) {
 	return false
 }
 
+// markSackedAndCollectGaps marks unacked packets that fall in SACK blocks and
+// returns a list of un-SACKed packets that should be considered lost
+// (i.e. packets older than the highest SACKed seq).
+//
+// Iterates the seq range [ack, maxRight] looking up the unacked map — O(span)
+// rather than O(total-unacked).
+//
+// Must be called with unackedMu held.
+func (rs *ReliableStream) markSackedAndCollectGaps(ack uint32, sackBlocks []SackBlock) []*unackedPacket {
+	if len(sackBlocks) == 0 {
+		return nil
+	}
+	// Find max sacked right edge
+	maxRight := sackBlocks[0].Right
+	for _, b := range sackBlocks[1:] {
+		if seqGreater(b.Right, maxRight) {
+			maxRight = b.Right
+		}
+	}
+	// Bound the scan defensively.
+	span := int32(maxRight - ack + 1)
+	if span <= 0 || span > MaxCwnd*2 {
+		span = MaxCwnd * 2
+	}
+	var lost []*unackedPacket
+	for i := int32(0); i < span; i++ {
+		seq := ack + uint32(i)
+		up, ok := rs.unacked[seq]
+		if !ok || up.sacked {
+			continue
+		}
+		// In any SACK block?
+		inSack := false
+		for _, b := range sackBlocks {
+			if !seqLess(seq, b.Left) && seqLessOrEqual(seq, b.Right) {
+				inSack = true
+				break
+			}
+		}
+		if inSack {
+			up.sacked = true
+			continue
+		}
+		// Older than highest SACKed seq → loss candidate.
+		if seqLess(seq, maxRight) {
+			lost = append(lost, up)
+		}
+	}
+	return lost
+}
+
 // processAck handles acknowledgment with SACK support
 func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 	rs.unackedMu.Lock()
@@ -460,29 +703,16 @@ func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 	oldBase := rs.sendBase.Load()
 	now := time.Now()
 
-	// Check for duplicate ACK (same ACK number)
-	// ACK=N means "I expect seq=N", so duplicate ACK is when ack == oldBase
+	// Duplicate-ACK path: ack == oldBase (no new cumulative progress)
 	if ack == oldBase {
 		rs.dupAckCount++
 
-		// Mark SACKed packets whenever we receive SACK blocks
-		if len(sackBlocks) > 0 {
-			for _, block := range sackBlocks {
-				for seq := block.Left; seqLessOrEqual(seq, block.Right); seq++ {
-					if up, ok := rs.unacked[seq]; ok {
-						up.sacked = true
-					}
-				}
-			}
-		}
+		// Mark SACKed packets and collect loss candidates.
+		lost := rs.markSackedAndCollectGaps(ack, sackBlocks)
 
-		// Determine if we should trigger retransmission
-		// SACK indicates gaps (packet loss), trigger immediate retransmit
-		// Also use classic fast retransmit on 3 duplicate ACKs without SACK
 		shouldRetransmit := false
 		if len(sackBlocks) > 0 {
-			// SACK-based retransmit: rate limit to avoid excessive retransmits
-			// Use a minimum interval based on RTT/2 or 10ms, whichever is larger
+			// SACK signals a gap. Rate-limit to half-RTT to avoid duplicate work.
 			minInterval := time.Duration(rs.rttEstimator.RTO()/2) * time.Millisecond
 			if minInterval < 10*time.Millisecond {
 				minInterval = 10 * time.Millisecond
@@ -492,46 +722,31 @@ func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 				rs.lastSackTime = now
 			}
 		} else if rs.dupAckCount >= FastRetransmitCount {
-			// Classic fast retransmit: 3 duplicate ACKs without SACK
 			shouldRetransmit = true
-			rs.dupAckCount = 0 // Reset only for classic fast retransmit
+			rs.dupAckCount = 0
 		}
 
 		if shouldRetransmit {
-			// Find packets to retransmit (not SACKed, starting from base)
 			var toRetransmit [][]byte
-
 			if len(sackBlocks) > 0 {
-				// SACK-based: retransmit all un-SACKed packets in gaps
-				// Find all gaps indicated by SACK blocks
-				prevRight := ack
-				for _, block := range sackBlocks {
-					// Retransmit packets in the gap before this SACK block
-					for seq := prevRight; seqLess(seq, block.Left); seq++ {
-						if up, ok := rs.unacked[seq]; ok && !up.sacked {
-							rs.retransmits.Add(1)
-							up.retries++
-							up.sentTime = now
-							toRetransmit = append(toRetransmit, up.data)
-						}
-					}
-					prevRight = block.Right + 1
+				rs.onLossFast() // reduce cwnd (only once per loss event)
+				for _, up := range lost {
+					rs.retransmits.Add(1)
+					up.retries++
+					up.sentTime = now
+					toRetransmit = append(toRetransmit, up.data)
 				}
 			} else {
-				// Classic fast retransmit: just retransmit the first unacked packet
+				// Classic fast retransmit: just the first unacked packet
 				if up, ok := rs.unacked[oldBase]; ok && !up.sacked {
+					rs.onLossFast()
 					rs.retransmits.Add(1)
 					up.retries++
 					up.sentTime = now
 					toRetransmit = append(toRetransmit, up.data)
 				}
 			}
-
 			rs.unackedMu.Unlock()
-
-			// Send retransmissions without holding lock
-			// Note: No RTO backoff for SACK/fast retransmit - these are loss-based,
-			// not timeout-based, so they don't indicate congestion
 			for _, data := range toRetransmit {
 				rs.sendFunc(data)
 			}
@@ -542,67 +757,67 @@ func (rs *ReliableStream) processAck(ack uint32, sackBlocks []SackBlock) {
 		return
 	}
 
-	// New ACK (ack advances), reset duplicate counter
+	// New cumulative ACK
 	rs.dupAckCount = 0
 
-	// Remove all packets before ack (cumulative ACK)
-	// ACK=N means "I expect seq=N next", i.e., "I received 0 to N-1"
-	for seq := range rs.unacked {
-		if seqLess(seq, ack) {
-			// Calculate RTT for packets that weren't retransmitted
-			up := rs.unacked[seq]
-			if up.retries == 0 {
-				rtt := float64(time.Since(up.sentTime).Milliseconds())
-				rs.rttEstimator.Update(rtt)
-			}
-			delete(rs.unacked, seq)
+	// Count and remove packets covered by cumulative ACK. Iterate the seq
+	// range (oldBase..ack-1) instead of the whole map — O(newly-acked) not
+	// O(total-unacked). The map is sparse only when packets are SACKed without
+	// cumulative coverage; lookups handle that case.
+	pktsAcked := int32(0)
+	// Bound the loop defensively so a malicious peer can't make us spin 2^32 times.
+	span := int32(ack - oldBase)
+	if span < 0 || span > MaxCwnd*2 {
+		span = MaxCwnd * 2
+	}
+	for i := int32(0); i < span; i++ {
+		seq := oldBase + uint32(i)
+		up, ok := rs.unacked[seq]
+		if !ok {
+			continue
 		}
+		if up.retries == 0 {
+			rtt := float64(time.Since(up.sentTime).Milliseconds())
+			rs.rttEstimator.Update(rtt)
+		}
+		delete(rs.unacked, seq)
+		pktsAcked++
 	}
 
-	// Process SACK blocks and immediately retransmit gaps
-	// Even with a new cumulative ACK, SACK blocks indicate out-of-order data
+	// Mark SACKed + identify gap losses (rate-limited).
 	var toRetransmit [][]byte
 	if len(sackBlocks) > 0 {
-		// Mark SACKed packets
-		for _, block := range sackBlocks {
-			for seq := block.Left; seqLessOrEqual(seq, block.Right); seq++ {
-				if up, ok := rs.unacked[seq]; ok {
-					up.sacked = true
-				}
-			}
-		}
-
-		// Rate-limited SACK-based retransmit
+		lost := rs.markSackedAndCollectGaps(ack, sackBlocks)
 		minInterval := time.Duration(rs.rttEstimator.RTO()/2) * time.Millisecond
 		if minInterval < 10*time.Millisecond {
 			minInterval = 10 * time.Millisecond
 		}
-		if now.Sub(rs.lastSackTime) >= minInterval {
+		if now.Sub(rs.lastSackTime) >= minInterval && len(lost) > 0 {
 			rs.lastSackTime = now
-			// Retransmit gaps indicated by SACK
-			prevRight := ack
-			for _, block := range sackBlocks {
-				for seq := prevRight; seqLess(seq, block.Left); seq++ {
-					if up, ok := rs.unacked[seq]; ok && !up.sacked {
-						rs.retransmits.Add(1)
-						up.retries++
-						up.sentTime = now
-						toRetransmit = append(toRetransmit, up.data)
-					}
-				}
-				prevRight = block.Right + 1
+			rs.onLossFast()
+			for _, up := range lost {
+				rs.retransmits.Add(1)
+				up.retries++
+				up.sentTime = now
+				toRetransmit = append(toRetransmit, up.data)
 			}
 		}
 	}
 
-	// Update send base
+	// Advance send base, grow cwnd, wake any Send waiter
 	if seqGreater(ack, rs.sendBase.Load()) {
 		rs.sendBase.Store(ack)
+	}
+	if pktsAcked > 0 {
+		rs.onAckAdvance(pktsAcked)
 	}
 
 	rs.unackedMu.Unlock()
 
-	// Send retransmissions without holding lock
+	if pktsAcked > 0 {
+		rs.signalWindowAvail()
+	}
+
 	for _, data := range toRetransmit {
 		rs.sendFunc(data)
 	}
@@ -623,7 +838,7 @@ func (rs *ReliableStream) buildSackBlocks() []SackBlock {
 		seqs = append(seqs, seq)
 	}
 
-	// Sort using insertion sort (small list)
+	// Insertion sort with wrap-aware comparison
 	for i := 1; i < len(seqs); i++ {
 		for j := i; j > 0 && seqLess(seqs[j], seqs[j-1]); j-- {
 			seqs[j], seqs[j-1] = seqs[j-1], seqs[j]
@@ -680,6 +895,8 @@ func (rs *ReliableStream) processData(seq uint32, data []byte) {
 				rs.outOfOrder[seq] = dataCopy
 			}
 		}
+		// Note: when buffer is full we still send SACK below, so the sender
+		// knows the current state and won't stall waiting for these gaps.
 		rs.outOfOrderMu.Unlock()
 
 		// Send duplicate ACK with SACK immediately
@@ -830,8 +1047,9 @@ func (rs *ReliableStream) checkRetransmit() {
 		}
 	}
 
-	// Backoff RTO if we have retransmissions
+	// On RTO retransmissions, drop cwnd hard and back off RTO.
 	if len(toRetransmit) > 0 {
+		rs.onLossRTO()
 		rs.rttEstimator.Backoff()
 	}
 	rs.unackedMu.Unlock()
@@ -849,6 +1067,8 @@ func (rs *ReliableStream) Close() {
 	}
 	close(rs.closeCh)
 	rs.cancelAckTimer()
+	// Wake any Send waiter
+	rs.signalWindowAvail()
 }
 
 // GetStats returns stream statistics

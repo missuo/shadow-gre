@@ -15,12 +15,13 @@ import (
 )
 
 const (
-	// maxReadSize must fit in MTU: 1500 - IP(20) - GRE(8) - ReliableHeader(13+SACK) = ~1450
-	// Use 1300 for safety margin with reliable headers and SACK blocks
-	maxReadSize = 1300
-	// greBufferSize needs to fit: GRE(8) + ReliableHeader(~45) + Data(1300) = ~1353
-	// Round up for alignment
-	greBufferSize = 1400
+	// maxReadSize is the per-packet TCP read budget. Sized so the on-the-wire
+	// IP packet fits in a 1500-byte MTU:
+	//   IP(20) + GRE(8) + Reliable hdr w/ ACK+SACK(13 + 1 + 4*8 = 46) + payload
+	//   1500 - 20 - 8 - 46 = 1426 max. Use 1400 to keep margin.
+	maxReadSize = 1400
+	// greBufferSize: GRE(8) + Reliable hdr (~46) + Data(1400) = ~1454
+	greBufferSize = 1500
 )
 
 // streamConn represents an active TCP connection
@@ -169,19 +170,23 @@ func (c *Client) handleConnection(tcpConn net.Conn) {
 	// TCP → GRE (read from TCP, send to GRE via reliable layer)
 	buf := make([]byte, maxReadSize)
 
-	for {
-		// Set read deadline to allow checking for server close
-		tcpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	// When the server closes the stream, unblock the Read immediately
+	// by setting a past deadline (single syscall, no polling).
+	stopRead := make(chan struct{})
+	go func() {
+		select {
+		case <-stopRead:
+		case <-sc.closeCh:
+			tcpConn.SetReadDeadline(time.Now())
+		}
+	}()
+	defer close(stopRead)
 
+	for {
 		n, err := tcpConn.Read(buf)
 		if err != nil {
-			// Check if server closed the stream
 			if sc.serverClosed.Load() {
 				break
-			}
-			// Check for timeout (not a real error, just checking for server close)
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
 			}
 			if err != io.EOF {
 				log.Printf("Stream %d read error: %v", streamID, err)
